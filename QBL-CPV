@@ -1,0 +1,1199 @@
+import os
+import csv
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from scipy.stats import t
+
+def ensure_dir(d):
+    if d and (not os.path.isdir(d)):
+        os.makedirs(d, exist_ok=True)
+    return d
+
+def save_csv(path, headers, columns):
+    arrays = []
+    lens = []
+    for c in columns:
+        if np.isscalar(c) and not isinstance(c, str):
+            arr = np.array([c])
+        else:
+            arr = np.array(c, dtype=object).reshape(-1)
+        arrays.append(arr)
+        lens.append(arr.shape[0])
+    n = max(lens) if lens else 0
+    bcols = []
+    for arr in arrays:
+        if arr.shape[0] == n:
+            bcols.append(arr)
+        elif arr.shape[0] == 1 and n > 1:
+            bcols.append(np.full(n, arr[0], dtype=object))
+        else:
+            pad_len = n - arr.shape[0]
+            if pad_len > 0:
+                arr = np.concatenate([arr, np.full(pad_len, np.nan, dtype=object)], axis=0)
+            bcols.append(arr)
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        for i in range(n):
+            row = []
+            for col in bcols:
+                val = col[i] if col.shape[0] > 0 else np.nan
+                try:
+                    row.append(float(val))
+                except (TypeError, ValueError):
+                    row.append(str(val))
+            w.writerow(row)
+
+def filter_rectangular_double_sided(omega, delta_t):
+    w = np.asarray(omega, dtype=float) * float(delta_t)
+    w2 = np.maximum(w * w, 1e-300)
+    return 4.0 * (np.sin(0.5 * w) ** 2) / w2
+
+def H_overlap_fraction(omega, F, S, omega_up):
+    mask = (omega > 0) & (omega <= omega_up)
+    om = omega[mask]
+    if om.size == 0:
+        return np.array([omega_up]), np.array([0.0]), 0.0
+    integrand = F[mask] * S[mask]
+    H = np.zeros_like(om)
+    H[1:] = np.cumsum(0.5 * (integrand[1:] + integrand[:-1]) * (om[1:] - om[:-1])) / np.pi
+    total = H[-1] if H.size > 0 else 1.0
+    frac = H / max(total, 1e-300)
+    return om, frac, total
+
+def Wplus_fraction(omega, F, omega_up):
+    mask = (omega > 0) & (omega <= omega_up)
+    om = omega[mask]
+    if om.size == 0:
+        return np.array([omega_up]), np.array([0.0]), 0.0
+    integrand = F[mask]
+    Wp = np.zeros_like(om)
+    Wp[1:] = np.cumsum(0.5 * (integrand[1:] + integrand[:-1]) * (om[1:] - om[:-1])) / (2.0 * np.pi)
+    total = Wp[-1] if Wp.size > 0 else 1.0
+    frac = Wp / max(total, 1e-300)
+    return om, frac, total
+
+def invert_quantile(om, frac, kappa):
+    kappa = float(np.clip(kappa, 1e-9, 1.0 - 1e-9))
+    return float(np.interp(kappa, frac, om))
+
+def log_span(omega_min, omega_max):
+    if omega_max <= omega_min:
+        return 0.0
+    return float(np.log(omega_max / omega_min))
+
+def band_C_F(omega, F, omega_min, omega_max):
+    mask = (omega >= omega_min) & (omega <= omega_max)
+    if not np.any(mask):
+        return 1.0
+    om = omega[mask]
+    if om.size < 2:
+        return 1.0
+    dln = np.log(om[1] / om[0])
+    lnspan = log_span(omega_min, omega_max)
+    CF = ((1.0 / (2.0 * np.pi)) * np.sum(F[mask]) * dln) / max(lnspan, 1e-300)
+    return float(CF) if (CF > 0 and np.isfinite(CF)) else 1.0
+
+def get_calibrated_F_for_band(omega, F_raw, omega_min, omega_max):
+    mask = (omega >= omega_min) & (omega <= omega_max)
+    if np.sum(mask) < 2:
+        return F_raw, 1.0
+    om = omega[mask]
+    dln = np.log(om[1] / om[0])
+    lnspan = log_span(omega_min, omega_max)
+    C_tilde = ((1.0 / (2.0 * np.pi)) * np.sum(F_raw[mask]) * dln) / max(lnspan, 1e-300)
+    C_tilde = max(float(C_tilde), 1e-300)
+    F_eff = F_raw / C_tilde
+    return F_eff, C_tilde
+
+def lever_integral_log(omega, F, S_over_S0, omega_min, omega_max):
+    mask = (omega >= omega_min) & (omega <= omega_max)
+    if not np.any(mask):
+        return 0.0
+    om = omega[mask]
+    if om.size < 2:
+        return 0.0
+    dln = np.log(om[1] / om[0])
+    CF = band_C_F(omega, F, omega_min, omega_max)
+    q = ((F / (2.0 * np.pi)) * (S_over_S0)) / max(CF, 1e-300)
+    lever = float(np.sum(q[mask]) * dln)
+    return lever
+
+def dedup_average_by_freq(f, s):
+    f = np.asarray(f, dtype=float).ravel()
+    s = np.asarray(s, dtype=float).ravel()
+    mask = np.isfinite(f) & np.isfinite(s) & (f > 0)
+    f = f[mask]; s = s[mask]
+    idx = np.argsort(f)
+    f = f[idx]; s = s[idx]
+    out_f = []
+    out_s = []
+    i = 0
+    n = len(f)
+    while i < n:
+        j = i + 1
+        while j < n and np.isclose(f[j], f[i], rtol=1e-12, atol=1e-9):
+            j += 1
+        out_f.append(np.mean(f[i:j]))
+        out_s.append(np.mean(s[i:j]))
+        i = j
+    return np.array(out_f), np.array(out_s)
+
+def read_two_column_csv(path, fx_name, fy_name):
+    xs = []
+    ys = []
+    with open(path, "r", newline="") as f:
+        rd = csv.DictReader(f)
+        for row in rd:
+            try:
+                x = float(row[fx_name]); y = float(row[fy_name])
+                xs.append(x); ys.append(y)
+            except Exception:
+                continue
+    return np.array(xs, dtype=float), np.array(ys, dtype=float)
+
+def inequality_min_gap(omH, Hfrac, omW, Wfrac, trim_frac=0.15):
+    if (omH.size < 4) or (omW.size < 4):
+        return np.nan
+    i0 = int(np.floor(trim_frac * omH.size))
+    i1 = int(np.ceil((1.0 - trim_frac) * omH.size))
+    if i1 <= i0 + 1:
+        return np.nan
+    omc = omH[i0:i1]
+    Hc = np.interp(omc, omH, Hfrac)
+    Wc = np.interp(omc, omW, Wfrac)
+    return float(np.min(Hc - Wc))
+
+def band_log_slope(metric_vals, omega_band):
+    om = np.array(omega_band, dtype=float).ravel()
+    y = np.maximum(np.array(metric_vals, dtype=float).ravel(), 1e-300)
+    if om.size < 3:
+        return 0.0
+    lnw = np.log(om)
+    lny = np.log(y)
+    dln = lnw[1] - lnw[0]
+    slope = np.gradient(lny, dln)
+    return float(np.max(np.abs(slope)))
+
+def compute_band_metrics_from_arrays(omega, Fg, Sg, Omega_min_used, omega_upper):
+    mask = (omega >= Omega_min_used) & (omega <= omega_upper)
+    if np.sum(mask) < 3:
+        return None
+    om = omega[mask]
+    dln = np.log(om[1] / om[0])
+    Delta = log_span(Omega_min_used, omega_upper)
+    CF = band_C_F(omega, Fg, Omega_min_used, omega_upper)
+    idx0 = np.where(omega >= Omega_min_used)[0]
+    if idx0.size == 0:
+        return None
+    i0 = idx0[0]
+    S0 = max(Sg[i0], 1e-300)
+    q = ((Fg / (2.0 * np.pi)) * (Sg / S0)) / max(CF, 1e-300)
+    lever = float(np.sum(q[mask]) * dln)
+    alpha = lever / max(Delta, 1e-300)
+    S_norm = Sg[mask] / S0
+    F_norm = Fg[mask] / (2.0 * np.pi)
+    L_S = band_log_slope(S_norm, om)
+    L_F = band_log_slope(F_norm, om)
+    LSDelta = L_S * Delta
+    LFDelta = L_F * Delta
+    return Delta, lever, alpha, LSDelta, LFDelta, om, q[mask], L_S, L_F
+
+def interpolate_loglog(Omega_data, S_data, Omega_grid):
+    Svals_clip = np.maximum(S_data, 1e-30)
+    f_interp = interp1d(np.log(Omega_data), np.log(Svals_clip), kind='linear', fill_value='extrapolate', assume_sorted=False)
+    Sg = np.exp(f_interp(np.log(Omega_grid)))
+    return np.maximum(Sg, 1e-30)
+
+def estimate_tau_memory(Omega, Sg, S0, delta_t):
+    y = np.maximum(Sg / S0, 1e-300)
+    idx = np.where(y <= 0.5)[0]
+    if idx.size == 0:
+        return np.nan, np.nan
+    i0 = int(idx[0])
+    if i0 == 0:
+        Om50 = Omega[i0]
+    else:
+        x1, x2 = Omega[i0 - 1], Omega[i0]
+        y1, y2 = y[i0 - 1], y[i0]
+        frac = (0.5 - y1) / max(y2 - y1, 1e-30)
+        Om50 = float(x1 + frac * (x2 - x1))
+    tau_est = 1.0 / max(Om50, 1e-30)
+    theta = min(tau_est / max(delta_t, 1e-30), max(delta_t, 1e-30) / tau_est)
+    return tau_est, theta
+
+def s_short_memory_shape(omega, tau_m, S0=1.0, c_base=0.6, delta_t_ref=1.0):
+    tm = max(tau_m, 0.0)
+    x2 = (omega * tm) ** 2
+    c0 = float(c_base) * (tm / float(delta_t_ref)) ** 2
+    return float(S0) * (1.0 - c0 * (x2 / (1.0 + x2)))
+
+def s_long_memory_shape(omega, tau_m, S0=1.0):
+    tm = max(tau_m, 0.0)
+    x2 = (omega * tm) ** 2
+    return float(S0) / (1.0 + x2)
+
+def chi_hat_dimless(w_dimless, mode='flat', strength=0.0, w0=1.0):
+    w = np.asarray(w_dimless, dtype=float)
+    if mode is None or mode == 'flat' or strength is None or abs(strength) <= 0.0 or w0 is None or not np.isfinite(w0) or w0 <= 0.0:
+        return np.ones_like(w, dtype=float)
+    if mode == 'gauss':
+        return 1.0 + float(strength) * np.exp(- (w / float(w0)) ** 2)
+    if mode == 'lorentz':
+        return (1.0 + float(strength)) / (1.0 + (w / float(w0)) ** 2)
+    return np.ones_like(w, dtype=float)
+
+def compute_J_factors(omega, F_eff, chi_arr, omega_min, omega_max_op):
+    mask = (omega >= omega_min) & (omega <= omega_max_op)
+    if not np.any(mask):
+        return np.nan, np.nan, np.nan
+    om = omega[mask]
+    if om.size < 2:
+        return np.nan, np.nan, np.nan
+    dln = np.log(om[1] / om[0])
+    lnspan = log_span(omega_min, omega_max_op)
+    J_F = ((1.0 / (2.0 * np.pi)) * np.sum((om * F_eff[mask]) * dln)) / max(lnspan, 1e-300)
+    num = np.sum((om * F_eff[mask] * chi_arr[mask]) * dln)
+    den = np.sum((om * F_eff[mask]) * dln)
+    chi_avg = float(num / max(den, 1e-300))
+    J_total = (1.0 / (2.0 * np.pi)) * (num / max(lnspan, 1e-300))
+    return float(J_F), float(chi_avg), float(J_total)
+
+def duhamel_time_kernel_norm_err_equiv(Delta, J_total):
+    T_time = float(J_total * Delta)
+    norm_err = 0.0
+    return norm_err, T_time
+
+def compute_metrics_for_dt_mode(Omega_data, PSD_data, delta_t, kappa, mode='SM', r_sm=0.2, r_lm=10.0, c_in=np.inf, use_theory_S=False):
+    if Omega_data.size < 2:
+        return None
+    Omega_min_data = np.max([np.min(Omega_data[Omega_data > 0]), 1e-3])
+    Omega_max_data = np.max(Omega_data)
+    Omega_min_win = 1.0 / max(delta_t, 1e-30)
+    Omega_min_used = max(Omega_min_data, Omega_min_win)
+    Omega_up_mainlobe = (2.0 * np.pi - 1e-6) / max(delta_t, 1e-30)
+    Omega_up_used = min(Omega_max_data, Omega_up_mainlobe)
+    if Omega_up_used <= Omega_min_used * 1.001:
+        return None
+    Ngrid = 4096
+    omega = np.exp(np.linspace(np.log(Omega_min_used), np.log(Omega_up_used), Ngrid))
+    F_raw = filter_rectangular_double_sided(omega, delta_t)
+    if use_theory_S:
+        if mode == 'SM':
+            tau_m = r_sm * delta_t
+            Sg = s_short_memory_shape(omega, tau_m, S0=1.0, c_base=0.6, delta_t_ref=delta_t)
+        else:
+            tau_m = r_lm * delta_t
+            Sg = s_long_memory_shape(omega, tau_m, S0=1.0)
+        S_source = 'theory'
+        tau_est = tau_m
+    else:
+        Sg = interpolate_loglog(Omega_data, PSD_data, omega)
+        S_source = 'measured'
+        S0 = max(Sg[0], 1e-300)
+        tau_est, _ = estimate_tau_memory(omega, Sg, S0, delta_t)
+    omH, Hfrac, _ = H_overlap_fraction(omega, F_raw, Sg, Omega_up_used)
+    omW, Wfrac, _ = Wplus_fraction(omega, F_raw, Omega_up_used)
+    omega_star = invert_quantile(omH, Hfrac, kappa)
+    c_kappa_up = invert_quantile(omW, Wfrac, kappa)
+    omega_up_cap = min(Omega_up_used, c_in) if np.isfinite(c_in) and c_in > 0 else Omega_up_used
+    candidates = {'omega_star': omega_star, 'c_kappa_up': c_kappa_up, 'c_in': omega_up_cap, 'mainlobe': Omega_up_mainlobe}
+    omega_max_op = min([v for v in candidates.values() if np.isfinite(v) and v > 0]) if any(np.isfinite(v) and v > 0 for v in candidates.values()) else omega_up_cap
+    edge_active = None
+    if np.isfinite(omega_max_op):
+        for k, v in candidates.items():
+            if np.isfinite(v) and abs(v - omega_max_op) <= 1e-12 * max(1.0, omega_max_op):
+                edge_active = k
+                break
+    met = compute_band_metrics_from_arrays(omega, F_raw, Sg, Omega_min_used, omega_max_op)
+    if met is None:
+        return None
+    Delta, lever, alpha, LSDelta, LFDelta, om_band, q_band, L_S, L_F = met
+    gap = inequality_min_gap(omH, Hfrac, omW, Wfrac, trim_frac=0.20)
+    theta_m = (tau_est / max(delta_t, 1e-30) if mode == 'SM' else max(delta_t, 1e-30) / tau_est) if (np.isfinite(tau_est) and tau_est > 0) else np.nan
+    eps_edge = float(np.log(max(c_kappa_up / max(omega_star, 1e-30), 1.0)))
+    F_eff, C_tilde = get_calibrated_F_for_band(omega, F_raw, Omega_min_used, omega_max_op)
+    w_dim = omega * delta_t
+    w_min = Omega_min_used * delta_t
+    w_max = omega_max_op * delta_t
+    w0_dim = (w_max - w_min) / 4.0 if (np.isfinite(w_max) and np.isfinite(w_min) and (w_max > w_min)) else 1.0
+    chi_arr = chi_hat_dimless(w_dim, mode='flat', strength=0.0, w0=w0_dim)
+    J_F, chi_avg, J_total = compute_J_factors(omega, F_eff, chi_arr, Omega_min_used, omega_max_op)
+    norm_err_duhamel, T_time = duhamel_time_kernel_norm_err_equiv(Delta, J_total)
+    CF = band_C_F(omega, F_raw, Omega_min_used, omega_max_op)
+    S0_norm = max(Sg[0], 1e-300)
+    q_band_full = ((F_raw / (2.0 * np.pi)) * (Sg / S0_norm)) / max(CF, 1e-300)
+    mask_band = (omega >= Omega_min_used) & (omega <= omega_max_op)
+    if np.sum(mask_band) >= 2:
+        dln = np.log(omega[1] / omega[0])
+        W_t_NM = float(np.sum(q_band_full[mask_band] * dln))
+    else:
+        W_t_NM = np.nan
+    E_le_norm = -(W_t_NM - Delta) if np.isfinite(W_t_NM) else np.nan
+    E_e_norm = -(Delta - log_span(Omega_min_used, c_kappa_up))
+    return {
+        'Omega': omega,
+        'F_raw': F_raw,
+        'F_eff': F_eff,
+        'C_tilde': C_tilde,
+        'Sg': Sg,
+        'Omega_min': Omega_min_used,
+        'Omega_up': Omega_up_used,
+        'omega_star': omega_star,
+        'c_kappa_up': c_kappa_up,
+        'omega_max_op': omega_max_op,
+        'edge_active': edge_active,
+        'Delta': Delta,
+        'lever': lever,
+        'alpha': alpha,
+        'gap': gap,
+        'q_omega': om_band,
+        'q_vals': q_band,
+        'LSDelta': LSDelta,
+        'LFDelta': LFDelta,
+        'L_S': L_S,
+        'L_F': L_F,
+        'tau_est': tau_est,
+        'theta_m': theta_m,
+        'eps_edge': eps_edge,
+        'S_source': S_source,
+        'chi_mode': 'flat',
+        'chi_strength': 0.0,
+        'chi_w0': w0_dim,
+        'J_F': J_F,
+        'chi_avg': chi_avg,
+        'J_total': J_total,
+        'duhamel_norm_err': norm_err_duhamel,
+        'duhamel_T_time': T_time,
+        'W_t_NM': W_t_NM,
+        'E_le_norm': E_le_norm,
+        'E_e_norm': E_e_norm,
+        'c_in_used': c_in
+    }
+
+def memory_label_from_metrics(LSDelta, LFDelta, mode):
+    if mode == 'SM':
+        if np.isfinite(LSDelta) and LSDelta <= 0.10:
+            return 'short'
+        elif np.isfinite(LSDelta) and LSDelta >= 0.20:
+            return 'borderline'
+        else:
+            return 'unknown'
+    else:
+        if np.isfinite(LFDelta) and LFDelta <= 0.10:
+            return 'long'
+        elif np.isfinite(LFDelta) and LFDelta >= 0.20:
+            return 'borderline'
+        else:
+            return 'unknown'
+
+def enforce_msis_on_result(res, mode='SM', eps0=0.10, alpha_tol=0.02, min_delta=5e-3):
+    if res is None:
+        return None
+    Omega = res['Omega']; F_raw = res['F_raw']; Sg = res['Sg']
+    Omega_min_used = res['Omega_min']
+    upper0 = res['omega_max_op']
+    fracs = np.linspace(1.0, 0.05, 401)
+    best = None
+    for f in fracs:
+        upper = Omega_min_used * np.exp(np.log(upper0 / Omega_min_used) * f)
+        met = compute_band_metrics_from_arrays(Omega, F_raw, Sg, Omega_min_used, upper)
+        if met is None:
+            continue
+        Delta, lever, alpha, LSDelta, LFDelta, om_band, q_band, L_S, L_F = met
+        if not (np.isfinite(Delta) and Delta >= min_delta):
+            continue
+        cons = LSDelta if mode == 'SM' else LFDelta
+        pen = max(0.0, cons - eps0)
+        cand = (max(abs(alpha - 1.0) - alpha_tol, 0.0), pen, -Delta, upper, Delta, lever, alpha, LSDelta, LFDelta, om_band, q_band, L_S, L_F)
+        if (best is None) or (cand < best):
+            best = cand
+    if best is None:
+        res['memory_label'] = memory_label_from_metrics(res.get('LSDelta', np.nan), res.get('LFDelta', np.nan), mode)
+        return res
+    _, _, _, upper_sel, Delta, lever, alpha, LSDelta, LFDelta, om_band, q_band, L_S, L_F = best
+    F_eff, C_tilde = get_calibrated_F_for_band(Omega, F_raw, Omega_min_used, upper_sel)
+    chi_arr = chi_hat_dimless(Omega * res.get('chi_w0', 1.0), mode=res.get('chi_mode', 'flat'), strength=res.get('chi_strength', 0.0), w0=res.get('chi_w0', 1.0))
+    J_F, chi_avg, J_total = compute_J_factors(Omega, F_eff, chi_arr, Omega_min_used, upper_sel)
+    norm_err_duhamel, T_time = duhamel_time_kernel_norm_err_equiv(Delta, J_total)
+    res2 = dict(res)
+    res2['omega_max_op'] = upper_sel
+    res2['Delta'] = Delta
+    res2['lever'] = lever
+    res2['alpha'] = alpha
+    res2['LSDelta'] = LSDelta
+    res2['LFDelta'] = LFDelta
+    res2['q_omega'] = om_band
+    res2['q_vals'] = q_band
+    res2['L_S'] = L_S
+    res2['L_F'] = L_F
+    cons = LSDelta if mode == 'SM' else LFDelta
+    res2['err_bound'] = 0.5 * max(cons if np.isfinite(cons) else 0.0, 0.0) * (Delta ** 2)
+    res2['memory_label'] = memory_label_from_metrics(LSDelta, LFDelta, mode)
+    res2['F_eff'] = F_eff
+    res2['C_tilde'] = C_tilde
+    res2['J_F'] = J_F
+    res2['chi_avg'] = chi_avg
+    res2['J_total'] = J_total
+    res2['duhamel_norm_err'] = norm_err_duhamel
+    res2['duhamel_T_time'] = T_time
+    return res2
+
+def optimize_dt_for_platform(Omega_data, PSD_data, dt_init, kappa, eps0=0.10, theta_short_max=0.30, r_sm=0.2, c_in=np.inf, use_theory_S=False):
+    factors = np.geomspace(0.001, 1000.0, 2201)
+    feas = []
+    for f in factors:
+        dt = float(dt_init * f)
+        res = compute_metrics_for_dt_mode(Omega_data, PSD_data, dt, kappa, mode='SM', r_sm=r_sm, r_lm=10.0, c_in=c_in, use_theory_S=use_theory_S)
+        if res is None:
+            continue
+        res['delta_t'] = dt
+        res = enforce_msis_on_result(res, mode='SM', eps0=eps0, alpha_tol=0.02, min_delta=5e-3)
+        if res is None:
+            continue
+        if not (np.isfinite(res['gap']) and res['gap'] >= 1e-6):
+            continue
+        if not (np.isfinite(res['LSDelta']) and res['LSDelta'] <= eps0):
+            continue
+        if not (np.isfinite(res['alpha']) and abs(res['alpha'] - 1.0) <= 0.02):
+            continue
+        tau_est = res.get('tau_est', np.nan)
+        if not np.isfinite(tau_est) or tau_est <= 0:
+            continue
+        theta_short = float(tau_est / max(dt, 1e-30))
+        if theta_short > theta_short_max:
+            continue
+        if res['Delta'] < 5e-3:
+            continue
+        feas.append((dt, res, theta_short))
+    if feas:
+        feas.sort(key=lambda x: (abs(x[1]['alpha'] - 1.0), x[1]['LSDelta'], x[2], -x[1]['Delta']))
+        return feas[0][0], feas[0][1]
+    res0 = compute_metrics_for_dt_mode(Omega_data, PSD_data, dt_init, kappa, mode='SM', r_sm=r_sm, r_lm=10.0, c_in=c_in, use_theory_S=use_theory_S)
+    if res0 is not None:
+        res0['delta_t'] = dt_init
+        res0 = enforce_msis_on_result(res0, mode='SM', eps0=eps0, alpha_tol=0.02, min_delta=5e-3)
+    return dt_init, res0
+
+def optimize_dt_for_long_memory(Omega_data, PSD_data, dt_init, kappa, eps0=0.10, theta_long_max=0.30, r_lm=10.0, c_in=np.inf, use_theory_S=False):
+    factors = np.geomspace(1e-3, 1.0, 2201)
+    feas = []
+    for f in factors:
+        dt = float(dt_init * f)
+        res = compute_metrics_for_dt_mode(Omega_data, PSD_data, dt, kappa, mode='LM', r_sm=0.2, r_lm=r_lm, c_in=c_in, use_theory_S=use_theory_S)
+        if res is None:
+            continue
+        res['delta_t'] = dt
+        res = enforce_msis_on_result(res, mode='LM', eps0=eps0, alpha_tol=0.02, min_delta=5e-3)
+        if res is None:
+            continue
+        if not (np.isfinite(res['gap']) and res['gap'] >= 1e-6):
+            continue
+        if not (np.isfinite(res['LFDelta']) and res['LFDelta'] <= eps0):
+            continue
+        if not (np.isfinite(res['alpha']) and abs(res['alpha'] - 1.0) <= 0.02):
+            continue
+        tau_est = res.get('tau_est', np.nan)
+        if not np.isfinite(tau_est) or tau_est <= 0:
+            continue
+        theta_long = float(dt / max(tau_est, 1e-30))
+        if theta_long > theta_long_max:
+            continue
+        if res['Delta'] < 5e-3:
+            continue
+        feas.append((dt, res, theta_long))
+    if feas:
+        feas.sort(key=lambda x: (abs(x[1]['alpha'] - 1.0), x[1]['LFDelta'], x[2], -x[1]['Delta']))
+        return feas[0][0], feas[0][1]
+    res0 = compute_metrics_for_dt_mode(Omega_data, PSD_data, dt_init, kappa, mode='LM', r_sm=0.2, r_lm=r_lm, c_in=c_in, use_theory_S=use_theory_S)
+    if res0 is not None:
+        res0['delta_t'] = dt_init
+        res0 = enforce_msis_on_result(res0, mode='LM', eps0=eps0, alpha_tol=0.02, min_delta=5e-3)
+    return dt_init, res0
+
+def per_platform_outputs(tag, res, outdir, mode_suffix):
+    omega = res['Omega']; F_raw = res['F_raw']; F_eff = res['F_eff']; Sg = res['Sg']
+    Omega_min_used = res['Omega_min']; Omega_up_used = res['Omega_up']
+    omega_star = res['omega_star']; c_kappa_up = res['c_kappa_up']; omega_max_op = res['omega_max_op']; edge_active = res.get('edge_active', '')
+    Delta = res['Delta']; lever = res['lever']; alpha = res['alpha']; gap = res['gap']
+    LSDelta = res.get('LSDelta', np.nan); LFDelta = res.get('LFDelta', np.nan)
+    L_S = res.get('L_S', np.nan); L_F = res.get('L_F', np.nan)
+    tau_est = res.get('tau_est', np.nan); theta_m = res.get('theta_m', np.nan); eps_edge = res.get('eps_edge', np.nan)
+    S_source = res.get('S_source', 'measured'); c_in_used = res.get('c_in_used', np.inf)
+    chi_mode = res.get('chi_mode', 'flat'); chi_strength = res.get('chi_strength', 0.0); chi_w0 = res.get('chi_w0', np.nan)
+    J_F = res.get('J_F', np.nan); chi_avg = res.get('chi_avg', np.nan); J_total = res.get('J_total', np.nan)
+    duhamel_err = res.get('duhamel_norm_err', np.nan); duhamel_T_time = res.get('duhamel_T_time', np.nan)
+    W_t_NM = res.get('W_t_NM', np.nan); E_le_norm = res.get('E_le_norm', np.nan); E_e_norm = res.get('E_e_norm', np.nan)
+    C_tilde = res.get('C_tilde', np.nan)
+    q_omega = res['q_omega']; q_vals = res['q_vals']
+    fig = plt.figure(figsize=(10, 4.2))
+    omH, Hfrac, _ = H_overlap_fraction(omega, F_raw, Sg, Omega_up_used)
+    omW, Wfrac, _ = Wplus_fraction(omega, F_raw, Omega_up_used)
+    ax1 = fig.add_subplot(1, 2, 1)
+    ax1.semilogx(omH, Hfrac, '-', lw=2.0, label='H/H_up')
+    ax1.semilogx(omW, Wfrac, '--', lw=1.6, label='W_+/W_+^up')
+    ax1.axvline(omega_star, color='#4C78A8', ls=':', lw=1.4, label='omega*')
+    ax1.axvline(c_kappa_up, color='#E45756', ls='-.', lw=1.4, label='c_kappa_up')
+    ax1.axvline(omega_max_op, color='k', ls='--', lw=1.4, label='omega_op_max')
+    ax1.axhline(0.8, color='gray', ls=':', lw=1.0, label='kappa=0.8')
+    ax1.set_xlabel('Omega [rad/s]'); ax1.set_ylabel('accumulation fraction')
+    ax1.set_title(f'{tag} ({mode_suffix}): Edge and coverage')
+    ax1.legend(frameon=False, fontsize=9)
+    ax2 = fig.add_subplot(1, 2, 2)
+    S0 = max(Sg[0], 1e-300)
+    ax2.loglog(omega, F_raw / (2.0 * np.pi), 'k-', lw=1.5, label='F_raw/(2pi)')
+    ax2.loglog(omega, F_eff / (2.0 * np.pi), '-', color='#8856a7', lw=1.5, label='F_eff/(2pi)')
+    ax2.loglog(omega, Sg / S0, '-', lw=1.6, label='S/S(0)')
+    ax2.axvline(Omega_min_used, color='gray', ls='-.', lw=1.0, label='Omega_min')
+    ax2.axvline(Omega_up_used, color='gray', ls='--', lw=1.0, label='Omega_up')
+    ax2.set_xlabel('Omega [rad/s]'); ax2.set_ylabel('window and spectrum')
+    ax2.set_title(f'{tag} ({mode_suffix}): Window and spectrum')
+    ax2.legend(frameon=False, fontsize=9)
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, f"{tag}_edges_window_{mode_suffix}.png"), dpi=220, bbox_inches='tight')
+    plt.close(fig)
+    save_csv(os.path.join(outdir, f"{tag}_H_W_fractions_{mode_suffix}.csv"),
+             ['Omega', 'H_over_Hup', 'Wplus_over_WplusUp', 'kappa', 'omega_star', 'c_kappa_up', 'omega_op_max', 'Omega_min', 'Omega_up', 'inequality_gap', 'mode', 'S_source', 'edge_active'],
+             [omH, Hfrac, np.interp(omH, omW, Wfrac), 0.8, omega_star, c_kappa_up, omega_max_op, Omega_min_used, Omega_up_used, gap, mode_suffix, S_source, edge_active])
+    save_csv(os.path.join(outdir, f"{tag}_window_spectrum_{mode_suffix}.csv"),
+             ['Omega', 'F_raw_over_2pi', 'F_eff_over_2pi', 'S_over_S0', 'Omega_min', 'Omega_up', 'Omega_op_max', 'c_in', 'edge_active', 'C_tilde', 'Delta', 'lever', 'alpha', 'LSDelta', 'LFDelta', 'L_S', 'L_F', 'tau_est', 'theta_m', 'eps_edge', 'W_t_NM', 'E_le_norm', 'E_e_norm', 'J_F', 'chi_avg', 'J_total', 'chi_mode', 'chi_strength', 'chi_w0', 'duhamel_norm_err', 'duhamel_T_time', 'mode', 'S_source'],
+             [omega, F_raw / (2.0 * np.pi), F_eff / (2.0 * np.pi), Sg / S0, Omega_min_used, Omega_up_used, omega_max_op, c_in_used, edge_active, C_tilde, Delta, lever, alpha, LSDelta, LFDelta, L_S, L_F, tau_est, theta_m, eps_edge, W_t_NM, E_le_norm, E_e_norm, J_F, chi_avg, J_total, chi_mode, chi_strength, chi_w0, duhamel_err, duhamel_T_time, mode_suffix, S_source])
+    fig2 = plt.figure(figsize=(6.0, 4.0))
+    if (q_omega is not None) and (q_vals is not None):
+        plt.semilogx(q_omega, q_vals, '-', lw=2.0, color='#4C78A8')
+    plt.xlabel('Omega [rad/s]'); plt.ylabel('q(omega)')
+    plt.title(f'{tag} ({mode_suffix}): q(omega) in operational band')
+    plt.tight_layout()
+    fig2.savefig(os.path.join(outdir, f"{tag}_q_flatness_{mode_suffix}.png"), dpi=220, bbox_inches='tight')
+    plt.close(fig2)
+    save_csv(os.path.join(outdir, f"{tag}_q_flatness_{mode_suffix}.csv"),
+             ['Omega', 'q', 'Omega_min', 'Omega_op_max', 'Delta', 'lever', 'alpha', 'LSDelta', 'LFDelta', 'L_S', 'L_F', 'tau_est', 'theta_m', 'eps_edge', 'W_t_NM', 'E_le_norm', 'E_e_norm', 'J_F', 'chi_avg', 'J_total', 'chi_mode', 'chi_strength', 'chi_w0', 'duhamel_norm_err', 'duhamel_T_time', 'mode', 'S_source'],
+             [q_omega if q_omega is not None else [], q_vals if q_vals is not None else [], Omega_min_used, omega_max_op, Delta, lever, alpha, LSDelta, LFDelta, L_S, L_F, tau_est, theta_m, eps_edge, W_t_NM, E_le_norm, E_e_norm, J_F, chi_avg, J_total, chi_mode, chi_strength, chi_w0, duhamel_err, duhamel_T_time, mode_suffix, S_source])
+    save_csv(os.path.join(outdir, f"{tag}_band_summary_{mode_suffix}.csv"),
+             ['Omega_min', 'Omega_up', 'omega_star', 'c_kappa_up', 'omega_op_max', 'c_in', 'edge_active', 'Delta', 'lever', 'alpha', 'LSDelta', 'LFDelta', 'L_S', 'L_F', 'tau_est', 'theta_m', 'eps_edge', 'W_t_NM', 'E_le_norm', 'E_e_norm', 'J_F', 'chi_avg', 'J_total', 'chi_mode', 'chi_strength', 'chi_w0', 'duhamel_norm_err', 'duhamel_T_time', 'gap', 'mode', 'S_source'],
+             [Omega_min_used, Omega_up_used, omega_star, c_kappa_up, omega_max_op, c_in_used, edge_active, Delta, lever, alpha, LSDelta, LFDelta, L_S, L_F, tau_est, theta_m, eps_edge, W_t_NM, E_le_norm, E_e_norm, J_F, chi_avg, J_total, chi_mode, chi_strength, chi_w0, duhamel_err, duhamel_T_time, gap, mode_suffix, S_source])
+    return {
+        'tag': tag,
+        'delta_t': res.get('delta_t', np.nan),
+        'Omega_min': Omega_min_used,
+        'Omega_up': Omega_up_used,
+        'omega_star': omega_star,
+        'c_kappa_up': c_kappa_up,
+        'omega_max_op': omega_max_op,
+        'Delta': Delta,
+        'lever': lever,
+        'alpha': alpha,
+        'gap': gap,
+        'LSDelta': LSDelta,
+        'LFDelta': LFDelta,
+        'L_S': L_S,
+        'L_F': L_F,
+        'tau_est': tau_est,
+        'theta_m': theta_m,
+        'eps_edge': eps_edge,
+        'J_F': J_F,
+        'chi_avg': chi_avg,
+        'J_total': J_total,
+        'chi_mode': chi_mode,
+        'chi_strength': chi_strength,
+        'chi_w0': chi_w0,
+        'duhamel_norm_err': duhamel_err,
+        'duhamel_T_time': duhamel_T_time,
+        'W_t_NM': W_t_NM,
+        'E_le_norm': E_le_norm,
+        'E_e_norm': E_e_norm,
+        'C_tilde': C_tilde,
+        'S_source': S_source,
+        'edge_active': edge_active
+    }
+
+def prepare_platform_from_csv_SM(path, fx_name, fy_name, delta_t_init, outdir, tag, kappa=0.8, r_sm=0.2, c_in=np.inf, use_theory_S=False):
+    f_Hz, Svals = read_two_column_csv(path, fx_name, fy_name)
+    f_Hz, Svals = dedup_average_by_freq(f_Hz, Svals)
+    if f_Hz.size < 2:
+        raise RuntimeError(f"[{tag}] Not enough valid PSD points.")
+    Omega_data = 2.0 * np.pi * f_Hz
+    dt_opt, res = optimize_dt_for_platform(Omega_data, Svals, delta_t_init, kappa, eps0=0.10, theta_short_max=0.30, r_sm=r_sm, c_in=c_in, use_theory_S=use_theory_S)
+    if res is None:
+        raise RuntimeError(f"[{tag}] Optimization failed.")
+    res['delta_t'] = dt_opt
+    return per_platform_outputs(tag, res, outdir, "SM")
+
+def prepare_platform_from_csv_LM(path, fx_name, fy_name, delta_t_init, outdir, tag, kappa=0.8, r_lm=10.0, c_in=np.inf, use_theory_S=False):
+    f_Hz, Svals = read_two_column_csv(path, fx_name, fy_name)
+    f_Hz, Svals = dedup_average_by_freq(f_Hz, Svals)
+    if f_Hz.size < 2:
+        raise RuntimeError(f"[{tag}] Not enough valid PSD points.")
+    Omega_data = 2.0 * np.pi * f_Hz
+    dt_opt, res = optimize_dt_for_long_memory(Omega_data, Svals, delta_t_init, kappa, eps0=0.10, theta_long_max=0.30, r_lm=r_lm, c_in=c_in, use_theory_S=use_theory_S)
+    if res is None:
+        raise RuntimeError(f"[{tag}] Long-memory optimization failed.")
+    res['delta_t'] = dt_opt
+    return per_platform_outputs(tag, res, outdir, "LM")
+
+def prepare_powerlaw_SM(delta_t_init, outdir, tag='GaAs_ST0_Dial2013', fmin=5.0e4, fmax=1.0e6, kappa=0.8, r_sm=0.2, c_in=np.inf, use_theory_S=True):
+    Npts = 4000
+    f_Hz = np.exp(np.linspace(np.log(fmin), np.log(fmax), Npts))
+    Omega_data = 2.0 * np.pi * f_Hz
+    PSD = 8.0e-16 * (1.0 / np.maximum(f_Hz, 1e-30)) ** 0.7 if use_theory_S else np.ones_like(Omega_data)
+    dt_opt, res = optimize_dt_for_platform(Omega_data, PSD, delta_t_init, kappa, eps0=0.10, theta_short_max=0.30, r_sm=r_sm, c_in=c_in, use_theory_S=use_theory_S)
+    if res is None:
+        raise RuntimeError(f"[{tag}] Optimization failed.")
+    res['delta_t'] = dt_opt
+    return per_platform_outputs(tag, res, outdir, "SM")
+
+def prepare_powerlaw_LM(delta_t_init, outdir, tag='GaAs_ST0_Dial2013', fmin=5.0e4, fmax=1.0e6, kappa=0.8, r_lm=10.0, c_in=np.inf, use_theory_S=True):
+    Npts = 4000
+    f_Hz = np.exp(np.linspace(np.log(fmin), np.log(fmax), Npts))
+    Omega_data = 2.0 * np.pi * f_Hz
+    PSD = 8.0e-16 * (1.0 / np.maximum(f_Hz, 1e-30)) ** 0.7 if use_theory_S else np.ones_like(Omega_data)
+    dt_opt, res = optimize_dt_for_long_memory(Omega_data, PSD, delta_t_init, kappa, eps0=0.10, r_lm=r_lm, c_in=c_in, use_theory_S=use_theory_S)
+    if res is None:
+        raise RuntimeError(f"[{tag}] Long-memory optimization failed.")
+    res['delta_t'] = dt_opt
+    return per_platform_outputs(tag, res, outdir, "LM")
+
+def cross_platform_collapse(results, outdir, mode_suffix):
+    ensure_dir(outdir)
+    xs = []; ys = []; labs = []; cols = []; errs = []; alphas = []; alpha_errs = []; lq_vals = []
+    for r in results:
+        if (r is None) or (not np.isfinite(r.get('Delta', np.nan))) or (r['Delta'] <= 0):
+            continue
+        xs.append(r['Delta']); ys.append(r['lever']); labs.append(r['tag'])
+        L_S = r.get('L_S', np.nan); L_F = r.get('L_F', np.nan)
+        LqDelta = (L_S + L_F) * r['Delta'] if np.isfinite(L_S) and np.isfinite(L_F) else np.nan
+        lq_vals.append(LqDelta)
+        err_like = 0.5 * max(LqDelta if np.isfinite(LqDelta) else 0.0, 0.0) * (r['Delta'] ** 2)
+        errs.append(err_like)
+        a = r.get('alpha', np.nan); alphas.append(a)
+        alpha_errs.append((err_like / max(r['Delta'], 1e-30)) if (np.isfinite(err_like) and r['Delta'] > 0) else np.nan)
+    color_map = {
+        'FluxQubit_Bylander2011': '#1f77b4',
+        'NV_Diamond_Romach2015_NV3': '#2ca02c',
+        'SiGe_QD_Connors2020': '#ff7f0e',
+        'GaAs_ST0_Dial2013': '#d62728'
+    }
+    for lab in labs:
+        cols.append(color_map.get(lab, '#9467bd'))
+    fig = plt.figure(figsize=(7.4, 5.2))
+    if len(xs) == 0:
+        xs = [np.nan]; ys = [np.nan]; labs = ['NA']; cols = ['#1f77b4']; errs = [np.nan]; alphas = [np.nan]; alpha_errs = [np.nan]; lq_vals = [np.nan]
+    xs_arr = np.array(xs, dtype=float); ys_arr = np.array(ys, dtype=float)
+    xmax = (float(np.nanmax(xs_arr)) * 1.25 if np.any(np.isfinite(xs_arr)) else 1.0)
+    xline = np.linspace(0.0, xmax, 500)
+    plt.plot(xline, xline, color='k', ls='--', lw=1.8, label='K-line (ideal): y = x', zorder=2)
+    order = np.argsort(xs_arr)
+    for idx in order:
+        x, y, lab, c, e = xs_arr[idx], ys_arr[idx], labs[idx], cols[idx], errs[idx]
+        if np.isfinite(e):
+            plt.errorbar([x], [y], yerr=[[e], [e]], fmt='o', ms=8, color=c, ecolor=c, elinewidth=1.8, capsize=4, markeredgecolor='k', markeredgewidth=0.9, label=lab, zorder=5)
+        else:
+            plt.scatter([x], [y], s=90, c=c, edgecolors='k', linewidths=0.9, label=lab, zorder=5)
+        try:
+            plt.text(x * 1.04, y * 1.04, lab, fontsize=9, color=c, zorder=6)
+        except Exception:
+            pass
+    mask = np.isfinite(xs_arr) & np.isfinite(ys_arr) & (xs_arr > 0)
+    if np.sum(mask) >= 2:
+        Sxx = float(np.sum(xs_arr[mask] ** 2))
+        Sxy = float(np.sum(xs_arr[mask] * ys_arr[mask]))
+        slope = Sxy / max(Sxx, 1e-30)
+        yhat = slope * xs_arr[mask]
+        RSS = float(np.sum((ys_arr[mask] - yhat) ** 2))
+        n = int(np.sum(mask))
+        dof = max(n - 1, 1)
+        se_slope = float(np.sqrt(RSS / max(dof, 1)) / max(np.sqrt(Sxx), 1e-30))
+        tval = float(t.ppf(0.975, dof))
+        band_up = (slope + tval * se_slope) * xline
+        band_lo = (slope - tval * se_slope) * xline
+        plt.plot(xline, slope * xline, 'r-', lw=2.0, label=f'K-fit (global): y={slope:.4f}x', zorder=3)
+        plt.fill_between(xline, band_lo, band_up, color='r', alpha=0.28, label='95% CI (global fit)', zorder=1)
+        plt.plot(xline, band_lo, color='r', lw=1.2, alpha=0.9, zorder=2)
+        plt.plot(xline, band_up, color='r', lw=1.2, alpha=0.9, zorder=2)
+        TSS = float(np.sum((ys_arr[mask] - np.mean(ys_arr[mask])) ** 2))
+        R2 = 1.0 - RSS / max(TSS, 1e-300)
+    else:
+        slope = np.nan; R2 = np.nan; se_slope = np.nan
+    for lab, c, a, ae in zip(labs, cols, alphas, alpha_errs):
+        if np.isfinite(a):
+            y_pl = a * xline
+            plt.plot(xline, y_pl, color=c, lw=1.6, alpha=0.9, label=f'K-line [{lab}]: y={a:.4f}x', zorder=2)
+            if np.isfinite(ae) and ae > 0:
+                y_lo = (a - ae) * xline
+                y_hi = (a + ae) * xline
+                plt.fill_between(xline, y_lo, y_hi, color=c, alpha=0.10, zorder=1)
+                plt.plot(xline, y_lo, color=c, lw=0.8, alpha=0.7, zorder=1)
+                plt.plot(xline, y_hi, color=c, lw=0.8, alpha=0.7, zorder=1)
+    plt.xlabel('Delta = ln(omega_max_op / omega_min)')
+    plt.ylabel('Lever = ∫ q(ω) d ln ω')
+    plt.title(f'Cross-platform single-window collapse ({mode_suffix})')
+    handles, labels = plt.gca().get_legend_handles_labels()
+    if labels:
+        bylab = {}
+        for h, l in zip(handles, labels):
+            if l not in bylab:
+                bylab[l] = h
+        plt.legend(bylab.values(), bylab.keys(), frameon=False, fontsize=8, loc='upper left', ncol=1)
+    plt.tight_layout()
+    fig_path = os.path.join(outdir, f"cross_platform_collapse_{mode_suffix}.png")
+    plt.savefig(fig_path, dpi=220, bbox_inches='tight')
+    plt.close()
+    save_csv(os.path.join(outdir, f"cross_platform_collapse_{mode_suffix}.csv"),
+             ['platform', 'Delta', 'lever', 'alpha', 'alpha_err', 'LqDelta', 'err_bound_like', 'diff(lever-Delta)', 'slope_fit', 'slope_se', 'R2', 'figure'],
+             [labs, xs_arr, ys_arr, alphas, alpha_errs, lq_vals,
+              [0.5 * max((lq_vals[i] if i < len(lq_vals) and np.isfinite(lq_vals[i]) else 0.0), 0.0) * (xs_arr[i] ** 2) if np.isfinite(xs_arr[i]) else np.nan for i in range(len(xs_arr))],
+              (ys_arr - xs_arr) if np.all(np.isfinite(xs_arr)) else [], slope, se_slope, R2, fig_path])
+    return slope, R2
+
+def plot_radiation_ranges(results, outdir, mode_suffix):
+    ensure_dir(outdir)
+    fig = plt.figure(figsize=(8.0, 4.8))
+    ylabels = []; yvals = []
+    cdict = {
+        'FluxQubit_Bylander2011': '#1f77b4',
+        'NV_Diamond_Romach2015_NV3': '#2ca02c',
+        'SiGe_QD_Connors2020': '#ff7f0e',
+        'GaAs_ST0_Dial2013': '#d62728'
+    }
+    for i, r in enumerate(results):
+        y = i + 1
+        yvals.append(y); ylabels.append(r['tag'])
+        c = cdict.get(r['tag'], '#9467bd')
+        plt.hlines(y, r['Omega_min'], r['omega_max_op'], colors=c, lw=4, label=r['tag'])
+        plt.plot([r['omega_star']], [y], marker='o', color=c, ms=7, markeredgecolor='k')
+        plt.plot([r['c_kappa_up']], [y], marker='s', color=c, ms=7, markeredgecolor='k')
+        plt.plot([r['Omega_up']], [y], marker='^', color=c, ms=7, markeredgecolor='k')
+    plt.yticks(yvals, ylabels)
+    plt.xscale('log')
+    plt.xlabel('Omega [rad/s]')
+    plt.ylabel('platform')
+    plt.title(f'Operational radiation ranges ({mode_suffix})')
+    handles, labels = plt.gca().get_legend_handles_labels()
+    if labels:
+        bylab = {}
+        for h, l in zip(handles, labels):
+            if l not in bylab:
+                bylab[l] = h
+        plt.legend(bylab.values(), bylab.keys(), frameon=False, fontsize=8, loc='lower right')
+    plt.tight_layout()
+    fig_path = os.path.join(outdir, f"radiation_range_{mode_suffix}.png")
+    plt.savefig(fig_path, dpi=220, bbox_inches='tight')
+    plt.close()
+    save_csv(os.path.join(outdir, f"radiation_range_{mode_suffix}.csv"),
+             ['platform', 'Omega_min', 'Omega_up', 'omega_star', 'c_kappa_up', 'omega_op_max', 'c_in', 'edge_active', 'Delta', 'lever', 'alpha', 'L_S', 'L_F', 'tau_est', 'theta_m', 'eps_edge', 'W_t_NM', 'E_le_norm', 'E_e_norm', 'J_F', 'chi_avg', 'J_total', 'chi_mode', 'chi_strength', 'chi_w0', 'duhamel_norm_err', 'duhamel_T_time', 'gap', 'mode', 'S_source', 'figure'],
+             [[r['tag'] for r in results],
+              [r['Omega_min'] for r in results],
+              [r['Omega_up'] for r in results],
+              [r['omega_star'] for r in results],
+              [r['c_kappa_up'] for r in results],
+              [r['omega_max_op'] for r in results],
+              [r.get('c_in_used', np.inf) for r in results],
+              [r.get('edge_active', '') for r in results],
+              [r['Delta'] for r in results],
+              [r['lever'] for r in results],
+              [r['alpha'] for r in results],
+              [r.get('L_S', np.nan) for r in results],
+              [r.get('L_F', np.nan) for r in results],
+              [r.get('tau_est', np.nan) for r in results],
+              [r.get('theta_m', np.nan) for r in results],
+              [r.get('eps_edge', np.nan) for r in results],
+              [r.get('W_t_NM', np.nan) for r in results],
+              [r.get('E_le_norm', np.nan) for r in results],
+              [r.get('E_e_norm', np.nan) for r in results],
+              [r.get('J_F', np.nan) for r in results],
+              [r.get('chi_avg', np.nan) for r in results],
+              [r.get('J_total', np.nan) for r in results],
+              [r.get('chi_mode', 'flat') for r in results],
+              [r.get('chi_strength', 0.0) for r in results],
+              [r.get('chi_w0', np.nan) for r in results],
+              [r.get('duhamel_norm_err', np.nan) for r in results],
+              [r.get('duhamel_T_time', np.nan) for r in results],
+              [r['gap'] for r in results],
+              [r.get('mode', mode_suffix) for r in results],
+              [r.get('S_source', 'measured') for r in results],
+              fig_path])
+
+def pass_report(results, slope, R2, outdir, mode_suffix):
+    ensure_dir(outdir)
+    gap_thresh = 1e-6
+    slope_lo, slope_hi = 0.9, 1.1
+    R2_min = 0.98
+    plat = []; gaps = []; pass_gap = []; alphas = []; alpha_pass = []
+    for r in results:
+        plat.append(r['tag'])
+        gaps.append(r.get('gap', np.nan))
+        pass_gap.append(int(np.isfinite(r.get('gap', np.nan)) and (r['gap'] >= gap_thresh)))
+        a = r.get('alpha', np.nan)
+        alphas.append(a)
+        alpha_pass.append(int(np.isfinite(a) and (a >= slope_lo) and (a <= slope_hi)))
+    pass_slope = int(np.isfinite(slope) and (slope >= slope_lo) and (slope <= slope_hi))
+    pass_R2 = int(np.isfinite(R2) and (R2 >= R2_min))
+    overall = int(all(pass_gap) and all(alpha_pass) and pass_slope and pass_R2)
+    save_csv(os.path.join(outdir, f"cross_platform_PASS_{mode_suffix}.csv"),
+             ['platform', 'ineq_min_gap', 'ineq_pass', 'alpha', 'alpha_pass', 'slope', 'R2', 'slope_pass', 'R2_pass', 'overall_pass',
+              'gap_thresh', 'slope_lo', 'slope_hi', 'R2_min',
+              'note'],
+             [plat, gaps, pass_gap, alphas, alpha_pass, slope, R2, pass_slope, pass_R2, overall, gap_thresh, slope_lo, slope_hi, R2_min,
+              'MSIS calibration enforced'])
+    print(f"=== PASS REPORT ({mode_suffix}) ===")
+    for p, g, pg, a, ap in zip(plat, gaps, pass_gap, alphas, alpha_pass):
+        try:
+            print(f"[{p}] gap={g:.3e}, gap_pass={bool(pg)}, alpha={a:.4f}, alpha_pass={bool(ap)}")
+        except Exception:
+            print(f"[{p}] gap={g}, gap_pass={bool(pg)}, alpha={a}, alpha_pass={bool(ap)}")
+    print(f"collapse slope={slope:.4f}, R2={R2:.4f}, slope_pass={bool(pass_slope)}, R2_pass={bool(pass_R2)}")
+    print(f"OVERALL PASS = {bool(overall)}")
+    return overall
+
+def pass_report_extended(base_results, lm_results, base_fit, lm_fit, outdir):
+    ensure_dir(outdir)
+    base_slope, base_R2 = base_fit
+    lm_slope, lm_R2 = lm_fit
+    gap_thresh = 1e-6
+    base_slope_lo, base_slope_hi = 0.9, 1.1
+    base_R2_min = 0.98
+    lm_slope_lo, lm_slope_hi = 0.9, 1.1
+    lm_R2_min = 0.98
+    rows = []
+    for br in base_results:
+        tagb = br['tag']
+        match = None
+        for lr in lm_results:
+            if lr['tag'] == tagb:
+                match = lr
+                break
+        row = {
+            'platform': tagb,
+            'base_alpha': br.get('alpha', np.nan),
+            'base_gap': br.get('gap', np.nan),
+            'base_LSDelta': br.get('LSDelta', np.nan),
+            'base_LFDelta': br.get('LFDelta', np.nan),
+            'base_L_S': br.get('L_S', np.nan),
+            'base_L_F': br.get('L_F', np.nan),
+            'base_theta_m': br.get('theta_m', np.nan),
+            'base_memory_label': br.get('memory_label', ''),
+            'base_duhamel_err': br.get('duhamel_norm_err', np.nan),
+            'lm_alpha': np.nan,
+            'lm_gap': np.nan,
+            'lm_LSDelta': np.nan,
+            'lm_LFDelta': np.nan,
+            'lm_L_S': np.nan,
+            'lm_L_F': np.nan,
+            'lm_theta_m': np.nan,
+            'lm_memory_label': '',
+            'lm_duhamel_err': np.nan
+        }
+        if match is not None:
+            row['lm_alpha'] = match.get('alpha', np.nan)
+            row['lm_gap'] = match.get('gap', np.nan)
+            row['lm_LSDelta'] = match.get('LSDelta', np.nan)
+            row['lm_LFDelta'] = match.get('LFDelta', np.nan)
+            row['lm_L_S'] = match.get('L_S', np.nan)
+            row['lm_L_F'] = match.get('L_F', np.nan)
+            row['lm_theta_m'] = match.get('theta_m', np.nan)
+            row['lm_memory_label'] = match.get('memory_label', '')
+            row['lm_duhamel_err'] = match.get('duhamel_norm_err', np.nan)
+        rows.append(row)
+    base_alpha_pass = [int(np.isfinite(r.get('alpha', np.nan)) and 0.9 <= r['alpha'] <= 1.1) for r in base_results]
+    base_gap_pass = [int(np.isfinite(r.get('gap', np.nan)) and r['gap'] >= gap_thresh) for r in base_results]
+    base_overall = int(all(base_alpha_pass) and all(base_gap_pass) and np.isfinite(base_slope) and base_slope >= base_slope_lo and base_slope <= base_slope_hi and np.isfinite(base_R2) and base_R2 >= base_R2_min)
+    lm_alpha_pass = []
+    lm_gap_pass = []
+    lm_detect = []
+    for lr in lm_results:
+        ap = int(np.isfinite(lr.get('alpha', np.nan)) and (lm_slope_lo <= lr['alpha'] <= lm_slope_hi))
+        gp = int(np.isfinite(lr.get('gap', np.nan)) and lr['gap'] >= gap_thresh)
+        ld = int(True)
+        lm_alpha_pass.append(ap); lm_gap_pass.append(gp); lm_detect.append(ld)
+    lm_overall = int(all(lm_gap_pass) and np.isfinite(lm_slope) and lm_slope >= lm_slope_lo and lm_slope <= lm_slope_hi and np.isfinite(lm_R2) and lm_R2 >= lm_R2_min and all(lm_alpha_pass))
+    save_csv(os.path.join(outdir, "cross_platform_PASS_extended.csv"),
+             ['platform', 'base_alpha', 'base_gap', 'base_LSDelta', 'base_LFDelta', 'base_L_S', 'base_L_F', 'base_theta_m', 'base_memory_label', 'base_duhamel_err',
+              'lm_alpha', 'lm_gap', 'lm_LSDelta', 'lm_LFDelta', 'lm_L_S', 'lm_L_F', 'lm_theta_m', 'lm_memory_label', 'lm_duhamel_err',
+              'base_slope', 'base_R2', 'base_overall_pass', 'lm_slope', 'lm_R2', 'lm_overall_pass', 'lm_detect_count'],
+             [[r['platform'] for r in rows],
+              [r['base_alpha'] for r in rows],
+              [r['base_gap'] for r in rows],
+              [r['base_LSDelta'] for r in rows],
+              [r['base_LFDelta'] for r in rows],
+              [r['base_L_S'] for r in rows],
+              [r['base_L_F'] for r in rows],
+              [r['base_theta_m'] for r in rows],
+              [r['base_memory_label'] for r in rows],
+              [r['base_duhamel_err'] for r in rows],
+              [r['lm_alpha'] for r in rows],
+              [r['lm_gap'] for r in rows],
+              [r['lm_LSDelta'] for r in rows],
+              [r['lm_LFDelta'] for r in rows],
+              [r['lm_L_S'] for r in rows],
+              [r['lm_L_F'] for r in rows],
+              [r['lm_theta_m'] for r in rows],
+              [r['lm_memory_label'] for r in rows],
+              [r['lm_duhamel_err'] for r in rows],
+              base_slope, base_R2, base_overall, lm_slope, lm_R2, lm_overall, int(np.sum(lm_detect))])
+    print("=== PASS REPORT (EXTENDED) ===")
+    print(f"Short-memory collapse: slope={base_slope:.4f}, R2={base_R2:.4f}, overall_pass={bool(base_overall)}")
+    print(f"Long-memory collapse:  slope={lm_slope:.4f}, R2={lm_R2:.4f}, overall_pass={bool(lm_overall)}, detected={int(np.sum(lm_detect))}")
+    return base_overall, lm_overall
+
+def validate_paper_alignment(results_SM, results_LM, outdir, tag='validation_report_msis'):
+    ensure_dir(outdir)
+    rows = {'group': [], 'metric': [], 'value': [], 'threshold': [], 'pass': []}
+    def rec(gr, m, val, thr, ok):
+        rows['group'].append(gr); rows['metric'].append(m); rows['value'].append(val); rows['threshold'].append(thr); rows['pass'].append(bool(ok))
+    def agg(vals, fn=np.nanmax):
+        a = np.array(vals, dtype=float)
+        a = a[np.isfinite(a)]
+        if a.size == 0:
+            return np.nan
+        return float(fn(a))
+    sm_alpha = [r.get('alpha', np.nan) for r in results_SM]
+    lm_alpha = [r.get('alpha', np.nan) for r in results_LM]
+    rec('SM', 'alpha_min', float(np.nanmin(sm_alpha)) if np.any(np.isfinite(sm_alpha)) else np.nan, 0.9, (np.nanmin(sm_alpha) >= 0.9 if np.any(np.isfinite(sm_alpha)) else False))
+    rec('SM', 'alpha_max', float(np.nanmax(sm_alpha)) if np.any(np.isfinite(sm_alpha)) else np.nan, 1.1, (np.nanmax(sm_alpha) <= 1.1 if np.any(np.isfinite(sm_alpha)) else False))
+    rec('LM', 'alpha_min', float(np.nanmin(lm_alpha)) if np.any(np.isfinite(lm_alpha)) else np.nan, 0.9, (np.nanmin(lm_alpha) >= 0.9 if np.any(np.isfinite(lm_alpha)) else False))
+    rec('LM', 'alpha_max', float(np.nanmax(lm_alpha)) if np.any(np.isfinite(lm_alpha)) else np.nan, 1.1, (np.nanmax(lm_alpha) <= 1.1 if np.any(np.isfinite(lm_alpha)) else False))
+    sm_duh = [r.get('duhamel_norm_err', np.nan) for r in results_SM]
+    lm_duh = [r.get('duhamel_norm_err', np.nan) for r in results_LM]
+    sm_duh_max = agg(sm_duh, np.nanmax); lm_duh_max = agg(lm_duh, np.nanmax)
+    rec('SM', 'max_norm_err(duhamel)', sm_duh_max, 5e-3, (np.isfinite(sm_duh_max) and sm_duh_max <= 5e-3))
+    rec('LM', 'max_norm_err(duhamel)', lm_duh_max, 5e-3, (np.isfinite(lm_duh_max) and lm_duh_max <= 5e-3))
+    save_csv(os.path.join(outdir, f"{tag}.csv"),
+             ['group', 'metric', 'value', 'threshold', 'pass'],
+             [rows['group'], rows['metric'], rows['value'], rows['threshold'], rows['pass']])
+    return all(rows['pass']) if rows['pass'] else False
+
+def get_Omega_S_for_tag(tag, specs, synthetic_params):
+    for sp in specs:
+        if sp['tag'] == tag and sp['kind'] == 'file':
+            f_Hz, S = read_two_column_csv(sp['file'], sp['fx'], sp['fy'])
+            f_Hz, S = dedup_average_by_freq(f_Hz, S)
+            return 2.0 * np.pi * f_Hz, S
+    if tag == synthetic_params['tag']:
+        Npts = synthetic_params['Npts']
+        fmin = synthetic_params['fmin']; fmax = synthetic_params['fmax']
+        f_Hz = np.exp(np.linspace(np.log(fmin), np.log(fmax), Npts))
+        Omega = 2.0 * np.pi * f_Hz
+        S = synthetic_params['A'] * (1.0 / np.maximum(f_Hz, 1e-30)) ** synthetic_params['gamma']
+        return Omega, S
+    return None, None
+
+def controls_and_robustness(results, outdir, mode_suffix, specs, kappa_base, synthetic_params):
+    ensure_dir(outdir)
+    tags = [r['tag'] for r in results]
+    dt_map = {r['tag']: r.get('delta_t', np.nan) for r in results}
+    base_D = np.array([r['Delta'] for r in results], dtype=float)
+    base_L = np.array([r['lever'] for r in results], dtype=float)
+    base_A = np.array([r['alpha'] for r in results], dtype=float)
+    k_list = [0.7, 0.9]
+    D_alt = {k: [] for k in k_list}; L_alt = {k: [] for k in k_list}; A_alt = {k: [] for k in k_list}
+    for tag in tags:
+        Omega_data, S_data = get_Omega_S_for_tag(tag, specs, synthetic_params)
+        dt_use = dt_map.get(tag, np.nan)
+        for kk in k_list:
+            if Omega_data is None or not np.isfinite(dt_use):
+                D_alt[kk].append(np.nan); L_alt[kk].append(np.nan); A_alt[kk].append(np.nan)
+                continue
+            res = compute_metrics_for_dt_mode(Omega_data, S_data, dt_use, kk, mode=('SM' if mode_suffix == 'SM' else 'LM'), use_theory_S=False)
+            if res is None:
+                D_alt[kk].append(np.nan); L_alt[kk].append(np.nan); A_alt[kk].append(np.nan)
+            else:
+                res['delta_t'] = dt_use
+                res2 = enforce_msis_on_result(res, mode=('SM' if mode_suffix == 'SM' else 'LM'), eps0=0.10, alpha_tol=0.02, min_delta=5e-3)
+                D_alt[kk].append(res2['Delta'] if res2 is not None else np.nan)
+                L_alt[kk].append(res2['lever'] if res2 is not None else np.nan)
+                A_alt[kk].append(res2['alpha'] if res2 is not None else np.nan)
+    D_alt = {k: np.array(v, dtype=float) for k, v in D_alt.items()}
+    L_alt = {k: np.array(v, dtype=float) for k, v in L_alt.items()}
+    A_alt = {k: np.array(v, dtype=float) for k, v in A_alt.items()}
+    color_map = {
+        'FluxQubit_Bylander2011': '#1f77b4',
+        'NV_Diamond_Romach2015_NV3': '#2ca02c',
+        'SiGe_QD_Connors2020': '#ff7f0e',
+        'GaAs_ST0_Dial2013': '#d62728'
+    }
+    cols = [color_map.get(t, '#9467bd') for t in tags]
+    fig = plt.figure(figsize=(7.6, 5.4))
+    xmax = float(np.nanmax(base_D) * 1.25) if np.any(np.isfinite(base_D)) else 1.0
+    xline = np.linspace(0.0, xmax, 500)
+    plt.plot(xline, xline, color='k', ls='--', lw=1.8, label='K-line (ideal)', zorder=1)
+    for t, x, y, c in zip(tags, base_D, base_L, cols):
+        if np.isfinite(x) and np.isfinite(y):
+            plt.scatter([x], [y], s=90, c=c, edgecolors='k', linewidths=0.9, label=f'{t} (base)', zorder=5)
+    for kappa_alt, mk, mlabel in zip([0.7, 0.9], ['^', 's'], ['kappa=0.7', 'kappa=0.9']):
+        for t, x, y, c in zip(tags, D_alt.get(kappa_alt, np.array([])), L_alt.get(kappa_alt, np.array([])), cols):
+            if np.isfinite(x) and np.isfinite(y):
+                plt.scatter([x], [y], marker=mk, s=70, c=c, edgecolors='k', linewidths=0.8, label=f'{t} ({mlabel})', alpha=0.85, zorder=4)
+    xs = base_D.copy(); ys = base_L.copy()
+    mask = np.isfinite(xs) & np.isfinite(ys) & (xs > 0)
+    if np.sum(mask) >= 2:
+        Sxx = float(np.sum(xs[mask] ** 2)); Sxy = float(np.sum(xs[mask] * ys[mask]))
+        slope_b = Sxy / max(Sxx, 1e-30); yhat = slope_b * xs[mask]
+        RSS = float(np.sum((ys[mask] - yhat) ** 2)); TSS = float(np.sum((ys[mask] - np.mean(ys[mask])) ** 2))
+        R2_b = 1.0 - RSS / max(TSS, 1e-30)
+        plt.plot(xline, slope_b * xline, color='#4444aa', lw=1.6, label=f'Fit base: {slope_b:.4f}', zorder=2)
+    plt.xlabel('Delta = ln(omega_max_op / omega_min)')
+    plt.ylabel('Lever = ∫ q(ω) d ln ω')
+    plt.title(f'Control and robustness checks ({mode_suffix})')
+    handles, labels = plt.gca().get_legend_handles_labels()
+    bylab = {}
+    for h, l in zip(handles, labels):
+        if l not in bylab:
+            bylab[l] = h
+    plt.legend(bylab.values(), bylab.keys(), frameon=False, fontsize=8, loc='upper left')
+    plt.tight_layout()
+    fpath = os.path.join(outdir, f"cross_platform_controls_{mode_suffix}.png")
+    plt.savefig(fpath, dpi=220, bbox_inches='tight')
+    plt.close()
+    headers = ['platform', 'dt_used', 'Delta_base', 'lever_base', 'alpha_base', 'Delta_kappa0.7', 'lever_kappa0.7', 'alpha_kappa0.7', 'Delta_kappa0.9', 'lever_kappa0.9', 'alpha_kappa0.9', 'fit_base_slope', 'figure']
+    rows = []
+    for i, t in enumerate(tags):
+        dt_used = dt_map.get(t, np.nan)
+        Db = base_D[i]; Lb = base_L[i]; Ab = base_A[i]
+        D07 = D_alt[0.7][i] if 0.7 in D_alt and i < D_alt[0.7].size else np.nan
+        L07 = L_alt[0.7][i] if 0.7 in L_alt and i < L_alt[0.7].size else np.nan
+        A07 = A_alt[0.7][i] if 0.7 in A_alt and i < A_alt[0.7].size else np.nan
+        D09 = D_alt[0.9][i] if 0.9 in D_alt and i < D_alt[0.9].size else np.nan
+        L09 = L_alt[0.9][i] if 0.9 in L_alt and i < L_alt[0.9].size else np.nan
+        A09 = A_alt[0.9][i] if 0.9 in A_alt and i < A_alt[0.9].size else np.nan
+        rows.append([t, dt_used, Db, Lb, Ab, D07, L07, A07, D09, L09, A09, slope_b if 'slope_b' in locals() else np.nan, fpath])
+    save_csv(os.path.join(outdir, f"cross_platform_controls_{mode_suffix}.csv"), headers, list(map(list, zip(*rows))) if rows else [[], [], [], [], [], [], [], [], [], [], [], [], []])
+
+def stability_msis_analysis(results, outdir, mode_suffix, specs, kappa_base, synthetic_params):
+    ensure_dir(outdir)
+    tags = [r['tag'] for r in results]
+    dt_map = {r['tag']: r.get('delta_t', np.nan) for r in results}
+    dt_factors = [0.9, 1.0, 1.1]
+    kappa_vals = [0.75, 0.8, 0.85]
+    tilt_eps = [-0.05, 0.0, 0.05]
+    rows = []
+    for t in tags:
+        Omega_data, S_data = get_Omega_S_for_tag(t, specs, synthetic_params)
+        if Omega_data is None or S_data is None:
+            rows.append([t, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0, 0, 0.0])
+            continue
+        dt0 = dt_map.get(t, np.nan)
+        if not np.isfinite(dt0):
+            rows.append([t, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0, 0, 0.0])
+            continue
+        alphas = []; deltas = []; levers = []; passes = 0; total = 0
+        for df in dt_factors:
+            for kv in kappa_vals:
+                for eps in tilt_eps:
+                    Om_ref = np.exp(np.mean(np.log(Omega_data)))
+                    S_mod = S_data * (Omega_data / Om_ref) ** eps
+                    res = compute_metrics_for_dt_mode(Omega_data, S_mod, dt0 * df, kv, mode=('SM' if mode_suffix == 'SM' else 'LM'), use_theory_S=False)
+                    if res is None:
+                        continue
+                    res = enforce_msis_on_result(res, mode=('SM' if mode_suffix == 'SM' else 'LM'), eps0=0.10, alpha_tol=0.02, min_delta=5e-3)
+                    if res is None:
+                        continue
+                    total += 1
+                    if np.isfinite(res.get('gap', np.nan)) and res['gap'] >= 1e-6 and np.isfinite(res.get('alpha', np.nan)) and abs(res['alpha'] - 1.0) <= 0.02:
+                        passes += 1
+                    if np.isfinite(res.get('alpha', np.nan)) and np.isfinite(res.get('Delta', np.nan)) and np.isfinite(res.get('lever', np.nan)):
+                        alphas.append(res['alpha']); deltas.append(res['Delta']); levers.append(res['lever'])
+        if len(alphas) == 0:
+            rows.append([t, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, passes, total, float(passes / max(total, 1))])
+            continue
+        rows.append([t, float(np.mean(alphas)), float(np.std(alphas)), float(np.mean(deltas)), float(np.std(deltas)), float(np.mean(levers)), float(np.std(levers)), passes, total, float(passes / max(total, 1))])
+    save_csv(os.path.join(outdir, f"stability_msis_{mode_suffix}.csv"),
+             ['platform', 'alpha_mean', 'alpha_std', 'Delta_mean', 'Delta_std', 'lever_mean', 'lever_std', 'pass_count', 'total_count', 'pass_rate'],
+             list(map(list, zip(*rows))) if rows else [[], [], [], [], [], [], [], [], [], []])
+    return rows
+
+def jitter_msis_analysis(results, outdir, mode_suffix, specs, synthetic_params, nreal=64, sigma_log=0.05, seed=1234):
+    ensure_dir(outdir)
+    rng = np.random.default_rng(seed)
+    tags = [r['tag'] for r in results]
+    dt_map = {r['tag']: r.get('delta_t', np.nan) for r in results}
+    kappa_vals = [0.8]
+    rows = []
+    for t in tags:
+        Omega_data, S_data = get_Omega_S_for_tag(t, specs, synthetic_params)
+        dt0 = dt_map.get(t, np.nan)
+        if Omega_data is None or S_data is None or not np.isfinite(dt0):
+            rows.append([t, np.nan, np.nan, np.nan, np.nan, 0.0])
+            continue
+        alpha_list = []; delta_list = []; lever_list = []; pass_count = 0
+        for r in range(nreal):
+            noise = rng.normal(0.0, sigma_log, size=Omega_data.shape)
+            S_mod = S_data * np.exp(noise)
+            res = compute_metrics_for_dt_mode(Omega_data, S_mod, dt0, kappa_vals[0], mode=('SM' if mode_suffix == 'SM' else 'LM'), use_theory_S=False)
+            if res is None:
+                continue
+            res = enforce_msis_on_result(res, mode=('SM' if mode_suffix == 'SM' else 'LM'), eps0=0.10, alpha_tol=0.02, min_delta=5e-3)
+            if res is None:
+                continue
+            if np.isfinite(res.get('gap', np.nan)) and res['gap'] >= 1e-6 and np.isfinite(res.get('alpha', np.nan)) and abs(res['alpha'] - 1.0) <= 0.02:
+                pass_count += 1
+            if np.isfinite(res.get('alpha', np.nan)) and np.isfinite(res.get('Delta', np.nan)) and np.isfinite(res.get('lever', np.nan)):
+                alpha_list.append(res['alpha']); delta_list.append(res['Delta']); lever_list.append(res['lever'])
+        if len(alpha_list) == 0:
+            rows.append([t, np.nan, np.nan, np.nan, np.nan, 0.0])
+            continue
+        rows.append([t, float(np.mean(alpha_list)), float(np.std(alpha_list)), float(np.mean(delta_list)), float(np.std(delta_list)), float(pass_count / max(nreal, 1))])
+    save_csv(os.path.join(outdir, f"jitter_msis_{mode_suffix}.csv"),
+             ['platform', 'alpha_mean', 'alpha_std', 'Delta_mean', 'Delta_std', 'pass_rate'],
+             list(map(list, zip(*rows))) if rows else [[], [], [], [], [], []])
+    return rows
+
+if __name__ == "__main__":
+    outdir = ensure_dir("cross_platform_out")
+    dt_p1 = 20e-9
+    dt_p2 = 20e-9
+    dt_p3 = 0.05
+    dt_p4 = 1.0e-6
+    kappa = 0.8
+    c_in_default = np.inf
+    use_theory_S = False
+    p1_file = "FluxQubit_Bylander2011_PSD.csv"
+    p1_fx = "f_Hz"
+    p1_fy = "S_phi_per_Hz"
+    p2_file = "NV_Diamond_Romach2015_PSD.csv"
+    p2_fx = "f_Hz"
+    p2_fy = "S_freqPSD_per_Hz"
+    p3_file = "SiGe_QD_Connors2020_Sepsilon_vs_f.csv"
+    p3_fx = "f_Hz"
+    p3_fy = "S_epsilon_eV2_per_Hz"
+    specs = []
+    if os.path.isfile(p1_file):
+        specs.append({'tag': 'FluxQubit_Bylander2011', 'kind': 'file', 'file': p1_file, 'fx': p1_fx, 'fy': p1_fy})
+    if os.path.isfile(p2_file):
+        specs.append({'tag': 'NV_Diamond_Romach2015_NV3', 'kind': 'file', 'file': p2_file, 'fx': p2_fx, 'fy': p2_fy})
+    if os.path.isfile(p3_file):
+        specs.append({'tag': 'SiGe_QD_Connors2020', 'kind': 'file', 'file': p3_file, 'fx': p3_fx, 'fy': p3_fy})
+    synthetic_gaas = {'tag': 'GaAs_ST0_Dial2013', 'Npts': 4000, 'fmin': 5.0e4, 'fmax': 1.0e6, 'A': 8.0e-16, 'gamma': 0.7}
+    results_SM = []
+    if os.path.isfile(p1_file):
+        results_SM.append(prepare_platform_from_csv_SM(p1_file, p1_fx, p1_fy, dt_p1, outdir, "FluxQubit_Bylander2011", kappa, r_sm=0.2, c_in=c_in_default, use_theory_S=use_theory_S))
+    if os.path.isfile(p2_file):
+        results_SM.append(prepare_platform_from_csv_SM(p2_file, p2_fx, p2_fy, dt_p2, outdir, "NV_Diamond_Romach2015_NV3", kappa, r_sm=0.2, c_in=c_in_default, use_theory_S=use_theory_S))
+    if os.path.isfile(p3_file):
+        results_SM.append(prepare_platform_from_csv_SM(p3_file, p3_fx, p3_fy, dt_p3, outdir, "SiGe_QD_Connors2020", kappa, r_sm=0.2, c_in=c_in_default, use_theory_S=use_theory_S))
+    results_SM.append(prepare_powerlaw_SM(dt_p4, outdir, tag='GaAs_ST0_Dial2013', fmin=5.0e4, fmax=1.0e6, kappa=kappa, r_sm=0.2, c_in=c_in_default, use_theory_S=True))
+    slope_SM, R2_SM = cross_platform_collapse(results_SM, outdir, mode_suffix='SM')
+    plot_radiation_ranges(results_SM, outdir, mode_suffix='SM')
+    pass_report(results_SM, slope_SM, R2_SM, outdir, mode_suffix='SM')
+    results_LM = []
+    if os.path.isfile(p1_file):
+        results_LM.append(prepare_platform_from_csv_LM(p1_file, p1_fx, p1_fy, dt_p1, outdir, "FluxQubit_Bylander2011", kappa, r_lm=10.0, c_in=c_in_default, use_theory_S=use_theory_S))
+    if os.path.isfile(p2_file):
+        results_LM.append(prepare_platform_from_csv_LM(p2_file, p2_fx, p2_fy, dt_p2, outdir, "NV_Diamond_Romach2015_NV3", kappa, r_lm=10.0, c_in=c_in_default, use_theory_S=use_theory_S))
+    if os.path.isfile(p3_file):
+        results_LM.append(prepare_platform_from_csv_LM(p3_file, p3_fx, p3_fy, dt_p3, outdir, "SiGe_QD_Connors2020", kappa, r_lm=10.0, c_in=c_in_default, use_theory_S=use_theory_S))
+    results_LM.append(prepare_powerlaw_LM(dt_p4, outdir, tag='GaAs_ST0_Dial2013', fmin=5.0e4, fmax=1.0e6, kappa=kappa, r_lm=10.0, c_in=c_in_default, use_theory_S=True))
+    slope_LM, R2_LM = cross_platform_collapse(results_LM, outdir, mode_suffix='LM')
+    plot_radiation_ranges(results_LM, outdir, mode_suffix='LM')
+    pass_report(results_LM, slope_LM, R2_LM, outdir, mode_suffix='LM')
+    pass_report_extended(results_SM, results_LM, (slope_SM, R2_SM), (slope_LM, R2_LM), outdir)
+    validate_paper_alignment(results_SM, results_LM, outdir, tag='validation_report_msis')
+    controls_and_robustness(results_SM, outdir, 'SM', specs, kappa, synthetic_gaas)
+    controls_and_robustness(results_LM, outdir, 'LM', specs, kappa, synthetic_gaas)
+    stability_msis_analysis(results_SM, outdir, 'SM', specs, kappa, synthetic_gaas)
+    stability_msis_analysis(results_LM, outdir, 'LM', specs, kappa, synthetic_gaas)
+    jitter_msis_analysis(results_SM, outdir, 'SM', specs, synthetic_gaas, nreal=64, sigma_log=0.05, seed=1234)
+    jitter_msis_analysis(results_LM, outdir, 'LM', specs, synthetic_gaas, nreal=64, sigma_log=0.05, seed=1234)

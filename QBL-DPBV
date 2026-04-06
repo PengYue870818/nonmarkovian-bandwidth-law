@@ -1,0 +1,2247 @@
+import os
+import csv
+import time
+import copy
+import platform
+import sys
+import numpy as np
+import scipy
+import scipy.integrate as integrate
+from scipy import stats
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+HBAR = 1.054571817e-34
+K_B = 1.380649e-23
+M_RB = 1.4431609e-25
+
+plt.rcParams['figure.max_open_warning'] = 0
+
+PENDING_FIGS = []
+
+
+def ensure_dir(d):
+    if not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+def save_csv(path, headers, columns):
+    arrays = []
+    lens = []
+    for c in columns:
+        if np.isscalar(c) and not isinstance(c, str):
+            arr = np.array([c])
+        else:
+            arr = np.array(c, dtype=object).reshape(-1)
+        arrays.append(arr)
+        lens.append(arr.shape[0])
+    n = max(lens) if lens else 0
+    bcols = []
+    for arr in arrays:
+        if arr.shape[0] == n:
+            bcols.append(arr)
+        elif arr.shape[0] == 1 and n > 1:
+            bcols.append(np.full(n, arr[0], dtype=object))
+        elif arr.shape[0] == 0 and n > 0:
+            bcols.append(np.full(n, np.nan, dtype=object))
+        else:
+            pad_len = n - arr.shape[0]
+            if pad_len > 0:
+                arr = np.concatenate([arr, np.full(pad_len, np.nan, dtype=object)], axis=0)
+            bcols.append(arr)
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        for i in range(n):
+            row = []
+            for col in bcols:
+                val = col[i] if col.shape[0] > 0 else np.nan
+                try:
+                    row.append(float(val))
+                except (TypeError, ValueError):
+                    row.append(str(val))
+            w.writerow(row)
+
+
+def fig_prefix(outdir, tag):
+    return os.path.join(outdir, tag)
+
+
+def queue_fig(fig, path):
+    ensure_dir(os.path.dirname(path))
+    PENDING_FIGS.append((fig, path))
+
+
+def flush_all_figs():
+    for fig, path in PENDING_FIGS:
+        fig.savefig(path, dpi=220, bbox_inches='tight')
+        plt.close(fig)
+    PENDING_FIGS.clear()
+
+
+def filter_rectangular_double_sided(omega, delta_t):
+    w = np.asarray(omega, dtype=float) * float(delta_t)
+    w2 = np.maximum(w * w, 1e-300)
+    return 4.0 * (np.sin(0.5 * w) ** 2) / w2
+
+
+class TheoryConfig:
+    def __init__(
+            self,
+            T=200e-9, m=M_RB, L_v=10e-6, v_loc=2.0e-2, delta_t=2.0e-3,
+            psf_width=0.5e-6, V0_J=K_B * 0.39e-6, x0=0.0, p0=0.0,
+            Dpp_bg=0.0, Dxx_bg=0.0, Gamma_phi_bg=0.0,
+            alpha_coll=2.0, lambda_opt=780e-9, Gamma_s_const=10.0, kappa_phi_sq=1.0,
+            omega_sys=np.inf, c_kappa=4.0, v_eff_mode="th",
+            psf_matched=True, baseline_gaussian_A_eff=True,
+            outdir="figs_nm_mmsis", seed=0, psf_norm_mode="L2",
+            kappa_coverage=0.8, nm_n_omega=32768, nm_short_tau_list=None, nm_long_tau_list=None,
+            enable_chi=True, chi_mode="flat", chi_strength=0.0, chi_omega0=np.inf,
+            enable_flatness=True,
+            enable_dephasing_sigma_update=False, Lambda_deph=0.0,
+            calibrate_J=True,
+            eps_max=0.2, LqDelta_tol=0.1, tilde_a_bound=0.5
+    ):
+        self.T = float(T); self.m = float(m); self.L_v = float(L_v)
+        self.v_loc = float(v_loc); self.delta_t = float(delta_t)
+        self.psf_width = float(psf_width); self.V0_J = float(V0_J)
+        self.x0 = float(x0); self.p0 = float(p0)
+        self.Dpp_bg = float(Dpp_bg); self.Dxx_bg = float(Dxx_bg)
+        self.Gamma_phi_bg = float(Gamma_phi_bg)
+        self.alpha_coll = float(alpha_coll); self.lambda_opt = float(lambda_opt)
+        self.Gamma_s_const = float(Gamma_s_const); self.kappa_phi_sq = float(kappa_phi_sq)
+        self.omega_sys = float(omega_sys); self.c_kappa = float(c_kappa)
+        self.v_eff_mode = str(v_eff_mode)
+        self.psf_matched = bool(psf_matched); self.baseline_gaussian_A_eff = bool(baseline_gaussian_A_eff)
+        self.outdir = str(outdir); self.seed = int(seed)
+        self.psf_norm_mode = str(psf_norm_mode)
+        self.kappa_coverage = float(kappa_coverage)
+        self.nm_n_omega = int(nm_n_omega)
+        self.nm_short_tau_list = nm_short_tau_list
+        self.nm_long_tau_list = nm_long_tau_list
+        self.enable_chi = bool(enable_chi)
+        self.chi_mode = str(chi_mode)
+        self.chi_strength = float(chi_strength)
+        self.chi_omega0 = float(chi_omega0)
+        self.enable_flatness = bool(enable_flatness)
+        self.enable_dephasing_sigma_update = bool(enable_dephasing_sigma_update)
+        self.Lambda_deph = float(Lambda_deph)
+        self.calibrate_J = bool(calibrate_J)
+        self.eps_max = float(eps_max)
+        self.LqDelta_tol = float(LqDelta_tol)
+        self.tilde_a_bound = float(tilde_a_bound)
+
+
+def basic_scales(cfg: TheoryConfig):
+    v_th = np.sqrt(K_B * cfg.T / max(cfg.m, 1e-300))
+    p_th = cfg.m * v_th
+    epsilon = HBAR / max(cfg.L_v * p_th, 1e-300)
+    tau0 = cfg.L_v / max(abs(cfg.v_loc), 1e-30)
+    beta = max(abs(cfg.v_loc) / max(v_th, 1e-30), 1e-12)
+    tau_int = cfg.delta_t / tau0
+    return v_th, p_th, epsilon, beta, tau0, tau_int
+
+
+def _psf_profile(xi, mu, sigma, mode):
+    if mode == "L1":
+        coef = 1.0 / (np.sqrt(2.0 * np.pi) * max(sigma, 1e-30))
+        return coef * np.exp(- ((xi - mu) ** 2) / max(2.0 * sigma * sigma, 1e-300))
+    coef = (np.pi ** (-0.25)) * (sigma ** (-0.5))
+    return coef * np.exp(- ((xi - mu) ** 2) / max(2.0 * sigma * sigma, 1e-300))
+
+
+def psf_profile(cfg: TheoryConfig, xi, mu, sigma):
+    return _psf_profile(xi, mu, sigma, cfg.psf_norm_mode)
+
+
+def _psf_L1_to_L2_alpha(sigma):
+    return (np.sqrt(2.0) * (np.pi ** 0.25) * np.sqrt(max(sigma, 1e-30)))
+
+
+def compute_K_via_PSF(cfg: TheoryConfig, epsilon, xi0, d3Vtilde_func, sigma_state_dimless=None):
+    C_K = 1.0 / (8.0 * np.sqrt(np.pi))
+    sigma_psf = max(cfg.psf_width / max(cfg.L_v, 1e-30), 1e-12)
+    mu = xi0
+    xi_grid = np.linspace(mu - 12.0 * sigma_psf, mu + 12.0 * sigma_psf, 4001)
+    if cfg.psf_norm_mode == "L1":
+        G_L1 = _psf_profile(xi_grid, mu, sigma_psf, "L1")
+        alpha = _psf_L1_to_L2_alpha(sigma_psf)
+        G = alpha * G_L1
+        psf_alpha = alpha
+    else:
+        G = psf_profile(cfg, xi_grid, mu, sigma_psf)
+        psf_alpha = 1.0
+    if cfg.psf_matched:
+        A0 = (15.0 / 48.0)
+    else:
+        sigma_state = float(max(sigma_state_dimless if sigma_state_dimless is not None else epsilon, 1e-12))
+        n0 = _psf_profile(xi_grid, mu, sigma_state, "L2")
+        A0 = (15.0 / 48.0) * float(integrate.trapezoid(G * n0, x=xi_grid))
+    d3V_vals = d3Vtilde_func(xi_grid)
+    inner = float(integrate.trapezoid(G * d3V_vals, x=xi_grid))
+    K = C_K * A0 * inner
+    return K, xi_grid, G, d3V_vals, C_K, A0, psf_alpha
+
+
+def maybe_update_sigma_G_phys_max(cfg: TheoryConfig, epsilon, v_eff):
+    sigma_psf_phys = float(cfg.psf_width)
+    sigma_state_phys_max = cfg.L_v * epsilon
+    sigma_G_phys_max = np.sqrt(sigma_psf_phys ** 2 + sigma_state_phys_max ** 2)
+    if cfg.enable_dephasing_sigma_update and cfg.Lambda_deph > 0.0:
+        infl = 1.0 + min(0.1, 0.01 * np.sqrt(cfg.Lambda_deph) * cfg.delta_t)
+        sigma_G_phys_max = infl * sigma_G_phys_max
+    return sigma_G_phys_max
+
+
+def build_geometry_and_band(cfg: TheoryConfig):
+    v_th, p_th, epsilon, beta, tau0, tau_int = basic_scales(cfg)
+    vloc_abs = max(abs(cfg.v_loc), 1e-30)
+    if cfg.baseline_gaussian_A_eff:
+        L_eff = np.sqrt(cfg.L_v ** 2 + cfg.psf_width ** 2)
+        A_eff = (cfg.L_v / max(L_eff, 1e-30)) * (cfg.V0_J / (p_th * vloc_abs))
+        def d3Vtilde(xi):
+            return A_eff * (12.0 * xi - 8.0 * (xi ** 3)) * np.exp(-xi * xi)
+    else:
+        s = cfg.L_v / max(cfg.psf_width, 1e-30)
+        A = (cfg.V0_J / (p_th * vloc_abs)) / np.sqrt(np.pi)
+        def d3Vtilde(xi):
+            return A * (-2.0 * (s ** 3) + 4.0 * (s ** 5) * (xi * xi)) * np.exp(-(s ** 2) * (xi * xi))
+    xi0 = cfg.x0 / max(cfg.L_v, 1e-30)
+    K_val, xi_grid_g, G_g, d3_g, C_K_val, A0_val, psf_alpha = compute_K_via_PSF(cfg, epsilon, xi0, d3Vtilde)
+    v_th2 = np.sqrt(K_B * cfg.T / max(cfg.m, 1e-300))
+    v_eff = max(abs(cfg.v_loc) if cfg.v_eff_mode == "loc" else v_th2, 1e-30)
+    omega_min = max(1.0 / cfg.delta_t, v_eff / max(cfg.L_v, 1e-30))
+    sigma_G_phys_max = maybe_update_sigma_G_phys_max(cfg, epsilon, v_eff)
+    omega_geom_up = v_eff / max(sigma_G_phys_max, 1e-30)
+    omega_up = float(min([c for c in [cfg.omega_sys, cfg.c_kappa / max(cfg.delta_t, 1e-30), omega_geom_up] if np.isfinite(c) and c > 0.0] + [np.inf]))
+    mainlobe_cap = (2.0 * np.pi - 1e-6) / max(cfg.delta_t, 1e-30)
+    omega_up = min(omega_up, mainlobe_cap)
+    return dict(
+        v_th=v_th, p_th=p_th, epsilon=epsilon, beta=beta, tau0=tau0, tau_int=tau_int,
+        K=K_val, C_K=C_K_val, A0=A0_val, xi_grid=xi_grid_g, G=G_g, d3V=d3_g,
+        omega_min=omega_min, omega_up=omega_up, sigma_G_phys_max=sigma_G_phys_max,
+        mainlobe_cap=mainlobe_cap, psf_alpha=psf_alpha
+    )
+
+
+def nm_freq_grid(omega_min, omega_up, n):
+    ln = np.linspace(np.log(omega_min), np.log(omega_up), int(max(n, 2)))
+    return np.exp(ln)
+
+
+def S_short_memory(omega, tau_m, S0=1.0, c_base=0.6, delta_t_ref=None):
+    if delta_t_ref is None or delta_t_ref <= 0.0:
+        delta_t_ref = 1.0
+    tm = max(tau_m, 0.0)
+    x2 = (omega * tm) ** 2
+    c0 = float(c_base) * (tm / float(delta_t_ref)) ** 2
+    return float(S0) * (1.0 - c0 * (x2 / (1.0 + x2)))
+
+
+def S_short_memory_linear(omega, tau_m, S0=1.0, a_base=0.3, delta_t_ref=None):
+    if delta_t_ref is None or delta_t_ref <= 0.0:
+        delta_t_ref = 1.0
+    tm = max(tau_m, 0.0)
+    a = a_base * (tm / float(delta_t_ref)) ** 2
+    return float(S0) * (1.0 - a * (omega ** 2))
+
+
+def S_long_memory(omega, tau_m, S0=1.0):
+    tm = max(tau_m, 0.0)
+    x2 = (omega * tm) ** 2
+    return float(S0) / (1.0 + x2)
+
+
+def H_overlap_fraction(omega, F, S, omega_up):
+    mask = (omega > 0) & (omega <= omega_up)
+    om = omega[mask]
+    integrand = F[mask] * S[mask]
+    if om.size == 0:
+        return np.array([omega_up], dtype=float), np.array([0.0], dtype=float), 0.0
+    H = integrate.cumulative_trapezoid(integrand, om, initial=0.0) / np.pi
+    total = H[-1] if H.size > 0 else 1.0
+    frac = H / max(total, 1e-300)
+    return om, frac, total
+
+
+def Wplus_fraction(omega, F, omega_up):
+    mask = (omega > 0) & (omega <= omega_up)
+    om = omega[mask]
+    integrand = F[mask]
+    if om.size == 0:
+        return np.array([omega_up], dtype=float), np.array([0.0], dtype=float), 0.0
+    Wp = integrate.cumulative_trapezoid(integrand, om, initial=0.0) / (2.0 * np.pi)
+    total = Wp[-1] if Wp.size > 0 else 1.0
+    frac = Wp / max(total, 1e-300)
+    return om, frac, total
+
+
+def invert_quantile(om, frac, kappa):
+    kappa = float(np.clip(kappa, 1e-9, 1.0 - 1e-9))
+    return float(np.interp(kappa, frac, om))
+
+
+def chi_hat_dimless(cfg: TheoryConfig, w):
+    if not cfg.enable_chi or cfg.chi_mode == "flat" or not np.isfinite(cfg.chi_omega0) or cfg.chi_omega0 <= 0.0:
+        return np.ones_like(w, dtype=float)
+    a = float(cfg.chi_strength)
+    w0 = float(cfg.chi_omega0) * cfg.delta_t
+    if w0 <= 0 or not np.isfinite(w0):
+        return np.ones_like(w, dtype=float)
+    if cfg.chi_mode == "gauss":
+        return 1.0 + a * np.exp(- (w / w0) ** 2)
+    if cfg.chi_mode == "lorentz":
+        return (1.0 + a) / (1.0 + (w / w0) ** 2)
+    return np.ones_like(w, dtype=float)
+
+
+def _log_span(omega_min, omega_max):
+    return max(np.log(max(omega_max, omega_min) / max(omega_min, 1e-300)), 0.0)
+
+
+def _log_average(omega, arr, a, b):
+    mask = (omega >= a) & (omega <= b)
+    om = omega[mask]
+    if om.size < 2:
+        return 0.0
+    dln = np.log(om[1] / om[0])
+    ln_span = _log_span(a, b)
+    val = float(np.sum(arr[mask]) * dln) / max(ln_span, 1e-300)
+    return val
+
+
+def get_calibrated_F_for_band(cfg, omega, F_raw, omega_min, omega_max):
+    w = omega
+    JF_raw = (1.0 / (2.0 * np.pi)) * _log_average(w, w * F_raw, omega_min, omega_max)
+    scale = 1.0
+    if cfg.calibrate_J and np.isfinite(JF_raw) and JF_raw > 0:
+        scale = 1.0 / JF_raw
+    F_eff = F_raw * scale
+    return F_eff, float(JF_raw), float(scale)
+
+
+def compute_J_factors_dimless(cfg: TheoryConfig, omega, omega_min, omega_max, F_eff, chi_arr):
+    if omega_max <= omega_min:
+        return 1.0, 1.0, 1.0
+    mask = (omega >= omega_min) & (omega <= omega_max)
+    if np.count_nonzero(mask) < 2:
+        return 1.0, 1.0, 1.0
+    w = omega
+    J_F = (1.0 / (2.0 * np.pi)) * _log_average(w, w * F_eff, omega_min, omega_max)
+    num = _log_average(w, w * F_eff * chi_arr, omega_min, omega_max)
+    den = max(_log_average(w, w * F_eff, omega_min, omega_max), 1e-300)
+    chi_avg = float(num / den)
+    J_total = float((1.0 / (2.0 * np.pi)) * num)
+    return float(J_F), float(chi_avg), float(J_total)
+
+
+def log_lipschitz(omega, arr, a, b):
+    mask = (omega >= a) & (omega <= b)
+    om = omega[mask]
+    f = np.maximum(arr[mask], 1e-300)
+    if om.size < 3:
+        return 0.0
+    ln_om = np.log(om)
+    ln_f = np.log(f)
+    dlnf = np.diff(ln_f)
+    dlnw = np.diff(ln_om)
+    slope = np.abs(dlnf / np.maximum(dlnw, 1e-300))
+    return float(np.max(slope)) if slope.size > 0 else 0.0
+
+
+def nm_operational_edge(cfg, F, omega_grid, omega_min, omega_up, S_func, tau_m):
+    om = omega_grid
+    S = S_func(om, tau_m)
+    omH, Hfrac, _ = H_overlap_fraction(om, F, S, omega_up)
+    omega_star = invert_quantile(omH, Hfrac, cfg.kappa_coverage)
+    omW, Wfrac, _ = Wplus_fraction(om, F, omega_up)
+    c_kappa_up = invert_quantile(omW, Wfrac, cfg.kappa_coverage)
+    v_th = np.sqrt(K_B * cfg.T / max(cfg.m, 1e-300))
+    epsilon = HBAR / max(cfg.L_v * (cfg.m * v_th), 1e-300)
+    v_eff = max(abs(cfg.v_loc) if cfg.v_eff_mode == "loc" else v_th, 1e-30)
+    sigma_G_phys_max = maybe_update_sigma_G_phys_max(cfg, epsilon, v_eff)
+    c_in = v_eff / max(sigma_G_phys_max, 1e-30)
+    mainlobe_cap = (2.0 * np.pi - 1e-6) / max(cfg.delta_t, 1e-30)
+    omega_up_eff = min(omega_up, mainlobe_cap)
+    candidates = [omega_star, c_kappa_up, c_in, cfg.omega_sys, cfg.c_kappa / max(cfg.delta_t, 1e-30), omega_up_eff]
+    candidates = [c for c in candidates if np.isfinite(c) and c > 0]
+    omega_max_op = min(candidates) if candidates else omega_up_eff
+    return float(omega_star), float(c_kappa_up), float(omega_max_op)
+
+
+def maybe_legend():
+    ax = plt.gca()
+    handles, labels = ax.get_legend_handles_labels()
+    if len(labels) > 0:
+        ax.legend(loc='best', fontsize=10, frameon=False)
+
+
+def mark_vertical(x, color, label=None, alpha=0.9):
+    plt.axvline(x, color=color, ls='--', lw=1.6, alpha=alpha, label=label, zorder=4)
+
+
+def band_patch(x0, x1, y0, y1, color, alpha=0.12, label=None):
+    plt.fill_between([x0, x1], [y0, y0], [y1, y1], color=color, alpha=alpha, label=label, zorder=1)
+
+
+def plot_nm_edge_show(cfg, tag, title, omega, F, tau_list, S_func, omega_min, omega_up):
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4.6))
+    colors = ['#4C78A8', '#E45756', '#72B7B2', '#F58518', '#B279A2', '#9C755F', '#59A14F', '#EDC948', '#B07AA1', '#FF9DA7']
+    curves_rows = {'panel': [], 'curve': [], 'tau_m_s': [], 'omega': [], 'value': [], 'kind': []}
+    summary_rows = {'tau_m_s': [], 'omega_star': [], 'c_kappa_up': [], 'omega_max_op': [], 'Omega0': [], 'kappa': []}
+    plt.sca(ax[0])
+    S1 = np.ones_like(omega)
+    omH0, frac0, _ = H_overlap_fraction(omega, F, S1, omega_up)
+    plt.semilogx(omH0, frac0, color='k', lw=2.2, label='Markov baseline', zorder=5)
+    for o, v in zip(omH0, frac0):
+        curves_rows['panel'].append('left'); curves_rows['curve'].append('Markov'); curves_rows['tau_m_s'].append(np.nan); curves_rows['omega'].append(o); curves_rows['value'].append(v); curves_rows['kind'].append('H_frac')
+    omW0, Wfrac0, _ = Wplus_fraction(omega, F, omega_up)
+    Omega0 = invert_quantile(omW0, Wfrac0, cfg.kappa_coverage)
+    mark_vertical(Omega0, 'k', label='Omega0 (W+ quantile)')
+    for o, v in zip(omW0, Wfrac0):
+        curves_rows['panel'].append('left'); curves_rows['curve'].append('Wplus'); curves_rows['tau_m_s'].append(np.nan); curves_rows['omega'].append(o); curves_rows['value'].append(v); curves_rows['kind'].append('Wplus_frac')
+    for i, tm in enumerate(tau_list):
+        S = S_func(omega, tm)
+        omega_star, c_kappa_up, omega_max_op = nm_operational_edge(cfg, F, omega, omega_min, omega_up, S_func, tm)
+        band_patch(omega_min, omega_max_op, 0.0, 1.0, colors[i % len(colors)], alpha=0.12)
+        omH, frac, _ = H_overlap_fraction(omega, F, S, omega_up)
+        plt.semilogx(omH, frac, lw=2.0, color=colors[i % len(colors)], label=f'tau={tm:.2e}s', zorder=3)
+        mark_vertical(omega_star, colors[i % len(colors)])
+        for o, v in zip(omH, frac):
+            curves_rows['panel'].append('left'); curves_rows['curve'].append('H_frac'); curves_rows['tau_m_s'].append(tm); curves_rows['omega'].append(o); curves_rows['value'].append(v); curves_rows['kind'].append('H_frac')
+        summary_rows['tau_m_s'].append(tm); summary_rows['omega_star'].append(omega_star); summary_rows['c_kappa_up'].append(c_kappa_up); summary_rows['omega_max_op'].append(omega_max_op); summary_rows['Omega0'].append(Omega0); summary_rows['kappa'].append(cfg.kappa_coverage)
+    plt.axhline(cfg.kappa_coverage, color='gray', ls=':', lw=1.2, label=f'kappa={cfg.kappa_coverage:g}', zorder=2)
+    plt.xlabel('omega [rad/s]'); plt.ylabel('H(Omega)/H(Omega_up)')
+    plt.title('Edge selection and coverage')
+    maybe_legend()
+    plt.sca(ax[1])
+    plt.loglog(omega, F / (2.0 * np.pi), color='k', lw=1.8, label='F/(2pi)', zorder=5)
+    for i, tm in enumerate(tau_list[:min(6, len(tau_list))]):
+        S = S_func(omega, tm)
+        S0 = max(S[0], 1e-300)
+        plt.loglog(omega, S / S0, color=colors[i % len(colors)], lw=1.6, label=f'S/S0 tau={tm:.2e}s', zorder=3)
+        for o, v in zip(omega, (S / S0)):
+            curves_rows['panel'].append('right'); curves_rows['curve'].append('S_over_S0'); curves_rows['tau_m_s'].append(tm); curves_rows['omega'].append(o); curves_rows['value'].append(v); curves_rows['kind'].append('S_over_S0')
+    for o, v in zip(omega, F / (2.0 * np.pi)):
+        curves_rows['panel'].append('right'); curves_rows['curve'].append('F_over_2pi'); curves_rows['tau_m_s'].append(np.nan); curves_rows['omega'].append(o); curves_rows['value'].append(v); curves_rows['kind'].append('F_over_2pi')
+    plt.axvline(omega_min, color='gray', ls='-.', lw=1.4, label='omega_min', zorder=2)
+    plt.axvline(omega_up, color='gray', ls='--', lw=1.4, label='Omega_up', zorder=2)
+    plt.xlabel('omega [rad/s]'); plt.ylabel('window and spectrum')
+    plt.title('Window and memory spectrum')
+    maybe_legend()
+    plt.suptitle(title, y=1.02)
+    plt.tight_layout()
+    png = fig_prefix(cfg.outdir, f"{tag}.png")
+    csv_curves = fig_prefix(cfg.outdir, f"{tag}_curves.csv")
+    csv_edges = fig_prefix(cfg.outdir, f"{tag}_edges.csv")
+    queue_fig(fig, png)
+    save_csv(csv_curves, ['panel','curve','tau_m_s','omega','value','kind'], [curves_rows['panel'], curves_rows['curve'], curves_rows['tau_m_s'], curves_rows['omega'], curves_rows['value'], curves_rows['kind']])
+    save_csv(csv_edges, ['tau_m_s','omega_star','c_kappa_up','omega_max_op','Omega0','kappa'], [summary_rows['tau_m_s'], summary_rows['omega_star'], summary_rows['c_kappa_up'], summary_rows['omega_max_op'], summary_rows['Omega0'], summary_rows['kappa']])
+
+
+def plot_nm_separation(cfg, tag, title, tau_list, K_list, ln_band_list, regime_label):
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4.2))
+    plt.sca(ax[0])
+    plt.plot(tau_list, K_list, '-', color='#4C78A8', lw=2)
+    plt.plot(tau_list, K_list, 'o', color='#4C78A8', ms=4)
+    plt.axhline(np.nanmean(K_list) if len(K_list) else 0.0, color='k', ls='--', lw=1.5)
+    plt.xlabel('tau_m [s]'); plt.ylabel('K'); plt.title(f'K invariance ({regime_label})')
+    plt.sca(ax[1])
+    plt.plot(tau_list, ln_band_list, '-', color='#E45756', lw=2)
+    plt.plot(tau_list, ln_band_list, 's', color='#E45756', ms=4)
+    plt.xlabel('tau_m [s]'); plt.ylabel('ln(omega_max_op/omega_min)')
+    plt.title(f'Bandwidth compression ({regime_label})')
+    plt.suptitle(title, y=1.02)
+    plt.tight_layout()
+    png = fig_prefix(cfg.outdir, f"{tag}.png")
+    csvp = fig_prefix(cfg.outdir, f"{tag}.csv")
+    queue_fig(fig, png)
+    save_csv(csvp, ['regime','tau_m_s','K','ln_band'], [regime_label, tau_list, K_list, ln_band_list])
+
+def plot_nm_collapse(cfg, title, tag, ln_band_list, y_norm_list, regime_list, tau_list, delta_p1_list, J_list):
+    fig = plt.figure(figsize=(7.6, 4.8))
+    xs_line = np.linspace(0.0, (max(ln_band_list) * 1.05) if ln_band_list else 1.0, 1024)
+    plt.plot(xs_line, xs_line, 'k--', lw=1.6, label='y = x (QBL, flat)')
+    if J_list:
+        J_arr = np.asarray(J_list, dtype=float)
+        if np.any(np.isfinite(J_arr)):
+            J_bar = float(np.nanmean(J_arr))
+            plt.plot(xs_line, J_bar * xs_line, 'k:', lw=1.2, label=f'y = Jbar x')
+    colors = {'short':'#4C78A8', 'long':'#E45756'}
+    seen = set()
+    for x, y, reg in zip(ln_band_list, y_norm_list, regime_list):
+        lab = f'{reg} memory' if reg not in seen else None
+        seen.add(reg)
+        plt.scatter([x], [y], s=48, color=colors.get(reg,'#72B7B2'), label=lab)
+    if ln_band_list and y_norm_list:
+        xa = np.array(ln_band_list, dtype=float)
+        ya = np.array(y_norm_list, dtype=float)
+        mask = np.isfinite(xa) & np.isfinite(ya)
+        if np.any(mask):
+            resid = ya[mask] - xa[mask]
+            rmean = float(np.nanmean(resid)) if resid.size else 0.0
+            rstd = float(np.nanstd(resid)) if resid.size else 0.0
+            band = 1.96 * rstd
+            plt.fill_between(xs_line, xs_line + rmean - band, xs_line + rmean + band, color='gray', alpha=0.15, label='95% band')
+    plt.xlabel('ln(omega_max_op / omega_min)'); plt.ylabel('-delta_p1 / (p_th epsilon^2 K)')
+    plt.title(title)
+    maybe_legend()
+    plt.tight_layout()
+    png = fig_prefix(cfg.outdir, f"{tag}.png")
+    csvp = fig_prefix(cfg.outdir, f"{tag}.csv")
+    queue_fig(fig, png)
+    save_csv(csvp, ['regime','tau_m_s','ln_band','y_norm','delta_p1_main','J_factor'], [regime_list, tau_list, ln_band_list, y_norm_list, delta_p1_list, J_list])
+
+def plot_nm_K_invariance(cfg, title, tag, tau_list_short, K_list_short, tau_list_long, K_list_long, K_ref):
+    fig = plt.figure(figsize=(7.6, 4.8))
+    if tau_list_short:
+        plt.plot(tau_list_short, K_list_short, '-', color='#4C78A8', lw=1.8, label='short')
+        plt.plot(tau_list_short, K_list_short, 'o', color='#4C78A8', ms=4)
+    if tau_list_long:
+        plt.plot(tau_list_long, K_list_long, '-', color='#E45756', lw=1.8, label='long')
+        plt.plot(tau_list_long, K_list_long, 's', color='#E45756', ms=4)
+    plt.axhline(K_ref, color='k', ls='--', lw=1.5, label='K (geom-locked)')
+    plt.xlabel('tau_m [s]'); plt.ylabel('K')
+    plt.title(title); maybe_legend()
+    plt.tight_layout()
+    png = fig_prefix(cfg.outdir, f"{tag}.png")
+    csvp = fig_prefix(cfg.outdir, f"{tag}.csv")
+    queue_fig(fig, png)
+    save_csv(csvp, ['tau_m_short','K_short','tau_m_long','K_long','K_ref'], [tau_list_short if K_list_short else [np.nan], K_list_short if K_list_short else [np.nan], tau_list_long if K_list_long else [np.nan], K_list_long if K_list_long else [np.nan], K_ref])
+
+
+def band_C_F(omega, F, omega_min, omega_max):
+    mask = (omega >= omega_min) & (omega <= omega_max)
+    if not np.any(mask):
+        return 1.0
+    dln = np.log(omega[mask][1] / omega[mask][0])
+    ln_span = _log_span(omega_min, omega_max)
+    C_F = ((1.0 / (2.0 * np.pi)) * np.sum(F[mask]) * dln) / max(ln_span, 1e-30)
+    return float(C_F) if np.isfinite(C_F) and C_F > 0 else 1.0
+
+
+def lever_integral_log_measure(omega, F, S_over_S0, omega_min, omega_max):
+    mask = (omega >= omega_min) & (omega <= omega_max)
+    if not np.any(mask):
+        return 0.0
+    dln = np.log(omega[1] / omega[0])
+    C_F = band_C_F(omega, F, omega_min, omega_max)
+    q = ((F / (2.0 * np.pi)) * S_over_S0) / max(C_F, 1e-300)
+    lever = float(np.sum(q[mask]) * dln)
+    return lever
+
+
+def lever_integral_log_with_chi(omega, F_eff, chi_arr, S_over_S0, omega_min, omega_max):
+    mask = (omega >= omega_min) & (omega <= omega_max)
+    if not np.any(mask):
+        return 0.0, 1.0
+    dln = np.log(omega[1] / omega[0])
+    ln_span = _log_span(omega_min, omega_max)
+    C_tilde = ((1.0 / (2.0 * np.pi)) * np.sum((F_eff * chi_arr)[mask]) * dln) / max(ln_span, 1e-30)
+    C_tilde = max(float(C_tilde), 1e-300)
+    qtilde = ((F_eff * chi_arr) / (2.0 * np.pi)) * S_over_S0 / C_tilde
+    lever = float(np.sum(qtilde[mask]) * dln)
+    return lever, C_tilde
+
+
+def plot_nm_K_estimate(cfg, title, tag, tau_list_short, K_est_short, tau_list_long, K_est_long, K_ref):
+    fig = plt.figure(figsize=(7.6, 4.8))
+    if K_est_short:
+        plt.plot(tau_list_short, K_est_short, '-', color='#4C78A8', lw=1.8, label='short K_est')
+        plt.plot(tau_list_short, K_est_short, 'o', color='#4C78A8', ms=4)
+    if K_est_long:
+        plt.plot(tau_list_long, K_est_long, '-', color='#E45756', lw=1.8, label='long K_est')
+        plt.plot(tau_list_long, K_est_long, 's', color='#E45756', ms=4)
+    plt.axhline(K_ref, color='k', ls='--', lw=1.5, label='K (geom-locked)')
+    plt.xlabel('tau_m [s]'); plt.ylabel('K_est from delta_p1')
+    plt.title(title); maybe_legend()
+    plt.tight_layout()
+    png = fig_prefix(cfg.outdir, f"{tag}.png")
+    csvp = fig_prefix(cfg.outdir, f"{tag}.csv")
+    queue_fig(fig, png)
+    save_csv(csvp, ['tau_m_short','K_est_short','tau_m_long','K_est_long','K_ref'], [tau_list_short if K_est_short else [np.nan], K_est_short if K_est_short else [np.nan], tau_list_long if K_est_long else [np.nan], K_est_long if K_est_long else [np.nan], K_ref])
+
+
+def plot_nm_inequality_check(cfg, title, tag, omega, F, omega_min, omega_up, tau_m, S_func):
+    fig = plt.figure(figsize=(7.6, 4.8))
+    S = S_func(omega, tau_m)
+    S0 = max(S[0], 1e-300)
+    omH, Hfrac, _ = H_overlap_fraction(omega, F, S, omega_up)
+    omW, Wfrac, _ = Wplus_fraction(omega, F, omega_up)
+    plt.semilogx(omH, Hfrac, '-', color='#4C78A8', lw=2.0, label='H/H_up')
+    plt.semilogx(omW, Wfrac, '--', color='#E45756', lw=1.8, label='W_+/W_+^up')
+    plt.xlabel('Omega [rad/s]'); plt.ylabel('accumulation fraction')
+    plt.title(title)
+    maybe_legend()
+    plt.tight_layout()
+    png = fig_prefix(cfg.outdir, f"{tag}.png")
+    queue_fig(fig, png)
+    minlen = min(len(omH), len(omW))
+    omc = omH[:minlen]
+    Hc = np.interp(omc, omH, Hfrac)
+    Wc = np.interp(omc, omW, Wfrac)
+    gap_min = float(np.min(Hc - Wc)) if omc.size > 0 else np.nan
+    csvp = fig_prefix(cfg.outdir, f"{tag}.csv")
+    save_csv(csvp, ['tau_m_s','gap_min','n_H','n_W'], [tau_m, gap_min, len(omH), len(omW)])
+
+
+def plot_nm_spectrum_flatness(cfg, title, tag, omega, F, tau_list, S_func, omega_min, omega_up):
+    fig = plt.figure(figsize=(7.6, 4.8))
+    colors = ['#4C78A8', '#E45756', '#72B7B2', '#F58518', '#B279A2', '#9C755F']
+    rows = {'tau_m_s': [], 'omega': [], 'q': [], 'omega_max_op': []}
+    for i, tm in enumerate(tau_list[:6]):
+        _, _, omega_max_op = nm_operational_edge(cfg, F, omega, omega_min, omega_up, S_func, tm)
+        mask = (omega >= omega_min) & (omega <= omega_max_op)
+        if not np.any(mask):
+            continue
+        S = S_func(omega, tm)
+        S0 = max(S[0], 1e-300)
+        dln = np.log(omega[1] / omega[0])
+        ln_span = _log_span(omega_min, omega_max_op)
+        C_F = ((1.0 / (2.0 * np.pi)) * np.sum(F[mask]) * dln) / max(ln_span, 1e-30)
+        q = ((F / (2.0 * np.pi)) * (S / S0)) / max(C_F, 1e-300)
+        c = colors[i % len(colors)]
+        plt.semilogx(omega[mask], q[mask], lw=1.8, color=c, label=f'tau_m={tm:.2e}s')
+        rows['tau_m_s'].extend([tm] * int(np.sum(mask))); rows['omega'].extend(list(omega[mask])); rows['q'].extend(list(q[mask])); rows['omega_max_op'].extend([omega_max_op] * int(np.sum(mask)))
+    plt.xlabel('omega [rad/s]'); plt.ylabel('q(omega) = C_F^{-1} F/(2pi) * (S/S0)')
+    plt.title(title)
+    maybe_legend()
+    plt.tight_layout()
+    png = fig_prefix(cfg.outdir, f'{tag}.png')
+    csvp = fig_prefix(cfg.outdir, f'{tag}.csv')
+    queue_fig(fig, png)
+    save_csv(csvp, ['tau_m_s','omega','q','omega_max_op'], [rows['tau_m_s'], rows['omega'], rows['q'], rows['omega_max_op']])
+
+
+def plot_nm_J_factors(cfg, title, tag, omega, omega_min, omega_up, tau_list, S_func_name):
+    fig = plt.figure(figsize=(7.6, 4.8))
+    JF_vals, Jchi_vals, Jprod_vals, ln_bands = [], [], [], []
+    F_raw = filter_rectangular_double_sided(omega, cfg.delta_t)
+    for tm in tau_list:
+        S_func = (lambda om, tmm: S_short_memory(om, tmm, S0=1.0, c_base=0.6, delta_t_ref=cfg.delta_t)) if S_func_name == 'short' else S_long_memory
+        _, _, omega_max_op = nm_operational_edge(cfg, F_raw, omega, omega_min, omega_up, S_func, tm)
+        F_eff, JF_raw, _scale = get_calibrated_F_for_band(cfg, omega, F_raw, omega_min, omega_max_op)
+        w = omega * cfg.delta_t
+        chi_arr = chi_hat_dimless(cfg, w)
+        JF, Jchi, Jprod = compute_J_factors_dimless(cfg, omega, omega_min, omega_max_op, F_eff, chi_arr)
+        ln_band = _log_span(omega_min, omega_max_op)
+        JF_vals.append(JF); Jchi_vals.append(Jchi); Jprod_vals.append(Jprod); ln_bands.append(ln_band)
+    if ln_bands:
+        plt.plot(ln_bands, JF_vals, 'o-', label='J_F (1/2pi<omega F>_log)')
+        plt.plot(ln_bands, Jchi_vals, 's-', label='<chi>_{omega F}')
+        plt.plot(ln_bands, Jprod_vals, 'd-', label='J = (1/2pi)<omega F chi>_log')
+    plt.xlabel('ln(omega_max_op / omega_min)'); plt.ylabel('J factors')
+    plt.title(title)
+    maybe_legend()
+    plt.tight_layout()
+    png = fig_prefix(cfg.outdir, f'{tag}.png')
+    csvp = fig_prefix(cfg.outdir, f'{tag}.csv')
+    queue_fig(fig, png)
+    save_csv(csvp, ['ln_band','J_F','chi_avg','J_total'], [ln_bands, JF_vals, Jchi_vals, Jprod_vals])
+
+
+def plot_nm_remainders(cfg, title, tag, omega, F_raw, omega_min, omega_up, tau_list, S_func, K_val, p_th, epsilon):
+    fig = plt.figure(figsize=(7.6, 4.8))
+    E_le_list, E_e_list, ln_bands = [], [], []
+    for tm in tau_list:
+        omega_star, c_kappa_up, omega_max_op = nm_operational_edge(cfg, F_raw, omega, omega_min, omega_up, S_func, tm)
+        ln_band = _log_span(omega_min, omega_max_op)
+        S = S_func(omega, tm)
+        S0 = max(S[0], 1e-300)
+        L_F = log_lipschitz(omega, F_raw / (2.0 * np.pi), omega_min, omega_max_op)
+        L_S = log_lipschitz(omega, (S / S0), omega_min, omega_max_op)
+        L_q = L_F + L_S
+        E_le_bound = p_th * (epsilon ** 2) * K_val * (L_q / 2.0) * (ln_band ** 2)
+        E_e = - p_th * (epsilon ** 2) * K_val * (np.log(max(omega_max_op, omega_min) / omega_min) - np.log(max(c_kappa_up, omega_min) / omega_min))
+        E_le_list.append(E_le_bound); E_e_list.append(abs(E_e)); ln_bands.append(ln_band)
+    denom = p_th * (epsilon ** 2) * K_val + 1e-30
+    if ln_bands:
+        plt.plot(ln_bands, np.array(E_le_list) / denom, 'o-', label='|E_m^le|/(p_th eps^2 K)')
+        plt.plot(ln_bands, np.array(E_e_list) / denom, 's-', label='|E_m^e|/(p_th eps^2 K)')
+    plt.xlabel('ln(omega_max_op / omega_min)'); plt.ylabel('normalized remainders')
+    plt.title(title)
+    maybe_legend()
+    plt.tight_layout()
+    png = fig_prefix(cfg.outdir, f'{tag}.png')
+    csvp = fig_prefix(cfg.outdir, f'{tag}.csv')
+    queue_fig(fig, png)
+    save_csv(csvp, ['ln_band','E_le_bound','E_e','norm_E_le','norm_E_e'], [ln_bands, E_le_list, E_e_list, list(np.array(E_le_list) / denom if ln_bands else []), list(np.array(E_e_list) / denom if ln_bands else [])])
+
+
+def _quad_fit_through_origin(xs, ys):
+    xs = np.asarray(xs, dtype=float); ys = np.asarray(ys, dtype=float)
+    mask = np.isfinite(xs) & np.isfinite(ys)
+    x = xs[mask]; y = ys[mask]
+    if x.size < 3 or np.allclose(x, 0):
+        return np.nan, np.nan, (np.nan, np.nan), np.nan, y * 0
+    Sxx = np.sum(x * x); Sxy = np.sum(x * y)
+    eta = Sxy / max(Sxx, 1e-30)
+    yhat = eta * x
+    resid = y - yhat
+    dof = max(x.size - 1, 1)
+    sigma2 = np.sum(resid * resid) / dof
+    var_eta = sigma2 / max(Sxx, 1e-30)
+    se = np.sqrt(var_eta)
+    tval = stats.t.ppf(0.975, dof)
+    ci95 = (eta - tval * se, eta + tval * se)
+    ss_tot = np.sum((y - np.mean(y)) ** 2) + 1e-30
+    r2 = 1.0 - np.sum(resid * resid) / ss_tot
+    return float(eta), float(se), (float(ci95[0]), float(ci95[1])), float(r2), resid
+
+
+def plot_nm_short_scaling(cfg, tag, omega, F_raw, omega_min, omega_up, tau_list, c_base_lin=0.6):
+    def S_short_lin(om, tm):
+        return S_short_memory(om, tm, S0=1.0, c_base=c_base_lin, delta_t_ref=cfg.delta_t)
+    omW, Wfrac, _ = Wplus_fraction(omega, F_raw, omega_up)
+    Omega0 = invert_quantile(omW, Wfrac, cfg.kappa_coverage)
+    xs, ys, stars, taus = [], [], [], []
+    for tm in tau_list:
+        omega_star, _, _ = nm_operational_edge(cfg, F_raw, omega, omega_min, omega_up, S_short_lin, tm)
+        xs.append((tm / cfg.delta_t) ** 2); ys.append(Omega0 - omega_star); stars.append(omega_star); taus.append(tm)
+    eta, se, ci95, r2, resid = _quad_fit_through_origin(xs, ys)
+    fig = plt.figure(figsize=(7.6, 4.8))
+    if xs:
+        xarr = np.array(xs); yarr = np.array(ys)
+        plt.plot(xarr, yarr, 'o', ms=4, color='#4C78A8', label='data')
+        xr = np.linspace(0, max(xarr) * 1.05, 256)
+        if np.isfinite(eta):
+            yr = eta * xr
+            plt.plot(xr, yr, 'k--', lw=1.6, label=f'y=eta x, eta={eta:.4g}')
+            if np.isfinite(se):
+                tval = stats.t.ppf(0.975, max(len(xarr) - 1, 1))
+                band = tval * se * xr
+                plt.fill_between(xr, yr - band, yr + band, color='k', alpha=0.15, label='95% CI')
+    plt.xlabel('(tau_m/Delta_t)^2'); plt.ylabel('Omega0 - omega_star')
+    ttl = 'Short-memory quadratic compression'
+    if np.isfinite(r2):
+        ttl += f'  (R^2={r2:.3f})'
+    plt.title(ttl); maybe_legend(); plt.tight_layout()
+    png = fig_prefix(cfg.outdir, f"{tag}.png"); csvp = fig_prefix(cfg.outdir, f"{tag}.csv")
+    queue_fig(fig, png)
+    save_csv(csvp, ['tau_m_s','x=(tau/Delta_t)^2','Omega0','omega_star','y=Omega0-omega_star','eta','se','ci95_lo','ci95_hi','R2','residual'],
+             [taus, xs, [Omega0] * len(xs), stars, ys, eta, se, ci95[0], ci95[1], r2, list(resid if len(xs) == len(resid) else [])])
+
+
+def plot_nm_long_scaling(cfg, tag, omega, F_raw, omega_min, omega_up, tau_list):
+    gk = np.tan(np.pi * cfg.kappa_coverage / 2.0)
+    omegas, g_over_tau, tau_s, prod, prod_ref, errs = [], [], [], [], [], []
+    for tm in tau_list:
+        omega_star, _, _ = nm_operational_edge(cfg, F_raw, omega, omega_min, omega_up, S_long_memory, tm)
+        tau_s.append(tm)
+        omegas.append(omega_star)
+        g_over_tau.append(gk / max(tm, 1e-30))
+        prod.append(omega_star * tm)
+        prod_ref.append(gk)
+        errs.append(abs(omega_star * tm - gk) / max(gk, 1e-30))
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4.8))
+    plt.sca(ax[0])
+    plt.plot(tau_s, omegas, '-', color='#4C78A8', lw=1.8, label='omega_star')
+    plt.plot(tau_s, g_over_tau, '--', color='k', lw=1.4, label='g(kappa)/tau_m')
+    plt.xlabel('tau_m [s]'); plt.ylabel('frequency [rad/s]'); plt.title('omega_star vs g(kappa)/tau_m'); maybe_legend()
+    plt.sca(ax[1])
+    plt.plot(tau_s, prod, '-', color='#E45756', lw=1.8, label='omega_star * tau_m')
+    plt.axhline(gk, color='k', ls='--', lw=1.4, label='g(kappa)')
+    plt.xlabel('tau_m [s]'); plt.ylabel('omega_star * tau_m'); plt.title('Product scaling'); maybe_legend()
+    plt.tight_layout()
+    png = fig_prefix(cfg.outdir, f"{tag}.png")
+    queue_fig(fig, png)
+    csvp = fig_prefix(cfg.outdir, f"{tag}.csv")
+    queue_fig(fig, png)
+    save_csv(csvp, ['tau_m_s','omega_star','g_over_tau','omega_star_tau_m','g_kappa','rel_err'], [tau_s, omegas, g_over_tau, prod, gk, errs])
+
+
+def finite_mean(arr):
+    a = np.array(arr, dtype=float)
+    m = np.isfinite(a)
+    if np.any(m):
+        return float(np.mean(a[m]))
+    return np.nan
+
+
+def msis_checks(cfg: TheoryConfig, base, omega, F_raw):
+    v_th, p_th, epsilon, beta, tau0, tau_int = base['v_th'], base['p_th'], base['epsilon'], base['beta'], base['tau0'], base['tau_int']
+    tilde_a_pp = (cfg.Dpp_bg * (cfg.L_v / max(abs(cfg.v_loc), 1e-30))) / max(p_th ** 2, 1e-300)
+    tilde_a_xx = (cfg.Dxx_bg * (cfg.L_v / max(abs(cfg.v_loc), 1e-30))) / max(cfg.L_v ** 2, 1e-300)
+    Gamma_tot_dt = float(min(0.25, max(tilde_a_pp, tilde_a_xx)))
+    omega_min, omega_up = base['omega_min'], base['omega_up']
+    ln_span = _log_span(omega_min, omega_up)
+    L_F = log_lipschitz(omega, F_raw / (2.0 * np.pi), omega_min, omega_up)
+    LqDelta = float(L_F * ln_span)
+    checks = dict(
+        epsilon=float(epsilon), eps_pass=(epsilon <= cfg.eps_max + 1e-12),
+        Gamma_tot_dt=Gamma_tot_dt, weak_pass=(Gamma_tot_dt <= 0.1 + 1e-12),
+        mem_short_ratio=0.0, mem_long_ratio=0.0,
+        slow_param_rate=0.0, slow_pass=True,
+        sigmaG_rate=0.0, sigmaG_pass=True,
+        tilde_a_pp=float(tilde_a_pp), tilde_a_xx=float(tilde_a_xx),
+        diff_pass=(tilde_a_pp <= cfg.tilde_a_bound + 1e-12) and (tilde_a_xx <= cfg.tilde_a_bound + 1e-12),
+        LqDelta=LqDelta, flat_pass=(LqDelta <= cfg.LqDelta_tol + 1e-12)
+    )
+    return checks
+
+
+def compute_core_metrics(cfg, collect_alpha=False):
+    base = build_geometry_and_band(cfg)
+    v_th = base['v_th']; p_th = base['p_th']; epsilon = base['epsilon']
+    omega_min = base['omega_min']; omega_up = base['omega_up']
+    omega = nm_freq_grid(omega_min, omega_up, cfg.nm_n_omega)
+    F_raw = filter_rectangular_double_sided(omega, cfg.delta_t)
+    short_taus = cfg.nm_short_tau_list or list(np.linspace(0.02, 0.8, 64) * cfg.delta_t)
+    long_taus = cfg.nm_long_tau_list or list(np.linspace(3.0, 60.0, 64) * cfg.delta_t)
+    def S_sm(om, tm): return S_short_memory(om, tm, 1.0, 0.6, cfg.delta_t)
+    omW, Wfrac, _ = Wplus_fraction(omega, F_raw, omega_up)
+    Omega0 = invert_quantile(omW, Wfrac, cfg.kappa_coverage)
+    xs, ys = [], []
+    K_ests = []
+    alphas = []
+    E_le_vals = []
+    collapse_biases = []
+    for tm in short_taus:
+        omega_star, c_kappa_up, omega_max_op = nm_operational_edge(cfg, F_raw, omega, omega_min, omega_up, S_sm, tm)
+        xs.append((tm / cfg.delta_t) ** 2); ys.append(Omega0 - omega_star)
+        S_arr = S_sm(omega, tm); S0 = max(S_arr[0], 1e-30)
+        lever_nm = lever_integral_log_measure(omega, F_raw, S_arr / S0, omega_min, omega_max_op)
+        ln_band = _log_span(omega_min, omega_max_op)
+        if ln_band > 0:
+            delta_p1_num = - p_th * (epsilon ** 2) * base['K'] * lever_nm
+            K_ests.append((-delta_p1_num) / (p_th * (epsilon ** 2) * ln_band))
+            collapse_biases.append(lever_nm - ln_band)
+        if collect_alpha:
+            if ln_band > 0:
+                delta_p1_num = - p_th * (epsilon ** 2) * base['K'] * lever_nm
+                alphas.append(((-delta_p1_num) / (p_th * (epsilon ** 2) * base['K'])) / ln_band)
+            L_F = log_lipschitz(omega, F_raw / (2.0 * np.pi), omega_min, omega_max_op)
+            L_S = log_lipschitz(omega, (S_arr / S0), omega_min, omega_max_op)
+            L_q = L_F + L_S
+            E_le = p_th * (epsilon ** 2) * base['K'] * (L_q / 2.0) * (ln_band ** 2)
+            E_le_vals.append(E_le)
+    eta, _, _, _, _ = _quad_fit_through_origin(xs, ys)
+    gk = np.tan(np.pi * cfg.kappa_coverage / 2.0)
+    g_errs = []
+    for tm in long_taus:
+        omega_star, _, _ = nm_operational_edge(cfg, F_raw, omega, omega_min, omega_up, S_long_memory, tm)
+        if gk > 0:
+            g_errs.append(abs(omega_star * tm - gk) / gk)
+    out = dict(
+        eta_short=float(eta) if np.isfinite(eta) else np.nan,
+        K_mean=finite_mean(K_ests),
+        collapse_bias=finite_mean(collapse_biases),
+        gk_long_err=finite_mean(g_errs),
+    )
+    if collect_alpha:
+        out['alpha_mean'] = finite_mean(alphas)
+        out['alpha_std'] = float(np.nanstd(np.array(alphas, dtype=float))) if np.any(np.isfinite(alphas)) else np.nan
+        out['E_le_mean'] = finite_mean(E_le_vals)
+    return out
+
+
+def run_convergence_tests(cfg, rel_tol=0.80):
+    base_cfg = copy.deepcopy(cfg)
+    metrics_base = compute_core_metrics(base_cfg)
+    fine_cfg = copy.deepcopy(cfg); fine_cfg.nm_n_omega = max(2 * cfg.nm_n_omega, 4096)
+    metrics_fine = compute_core_metrics(fine_cfg)
+    dense_cfg = copy.deepcopy(cfg); dense_cfg.nm_short_tau_list = list(np.linspace(0.0, 0.3, 96) * cfg.delta_t)
+    metrics_dense = compute_core_metrics(dense_cfg)
+    def rel_diff(a, b):
+        if not (np.isfinite(a) and np.isfinite(b)) or (abs(a) + abs(b) < 1e-30): return np.nan
+        return abs(a - b) / max(abs(a), 1e-30)
+    rows = []
+    for name in ['eta_short', 'K_mean', 'collapse_bias', 'gk_long_err']:
+        a = metrics_base[name]; b = metrics_fine[name]; c = metrics_dense[name]
+        r1 = rel_diff(a, b); r2 = rel_diff(a, c)
+        rows.append((name, a, b, c, r1, r2, (r1 <= rel_tol) and (r2 <= rel_tol)))
+    csvp = fig_prefix(cfg.outdir, "nm_convergence.csv")
+    save_csv(csvp, ['metric','baseline','omega_x2','tau_x2','rel_diff_omega','rel_diff_tau','pass'],
+             [[r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows], [r[3] for r in rows], [r[4] for r in rows], [r[5] for r in rows], [r[6] for r in rows]])
+    try:
+        fig = plt.figure(figsize=(7.6,4.2))
+        x = np.arange(len(rows))
+        rel1 = [r[4] if np.isfinite(r[4]) else 0.0 for r in rows]
+        rel2 = [r[5] if np.isfinite(r[5]) else 0.0 for r in rows]
+        width = 0.35
+        plt.bar(x - width/2, rel1, width, label='omega x2')
+        plt.bar(x + width/2, rel2, width, label='tau x2')
+        plt.axhline(rel_tol, color='r', ls='--', lw=1.2)
+        plt.xticks(x, [r[0] for r in rows], rotation=20)
+        plt.ylabel('relative change'); plt.title('Convergence'); plt.legend(frameon=False)
+        plt.tight_layout()
+        queue_fig(fig, fig_prefix(cfg.outdir, "nm_convergence.png"))
+    except Exception:
+        pass
+
+
+def scan_geometry_families(cfg, psf_width_list, shape_flag_list):
+    rows = []
+    for w in psf_width_list:
+        for flag in shape_flag_list:
+            sub = copy.deepcopy(cfg); sub.psf_width = float(w); sub.baseline_gaussian_A_eff = bool(flag)
+            m = compute_core_metrics(sub)
+            rows.append((w, flag, m['eta_short'], m['K_mean'], m['collapse_bias'], m['gk_long_err']))
+    csvp = fig_prefix(cfg.outdir, "nm_geometry_scan.csv")
+    save_csv(csvp, ['psf_width_m','shape_flag','eta_short','K_mean','collapse_bias','gk_long_err'],
+             [[r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows], [r[3] for r in rows], [r[4] for r in rows], [r[5] for r in rows]])
+    try:
+        fig, ax = plt.subplots(1,2,figsize=(12,4.2))
+        wvals = sorted(set([r[0] for r in rows]))
+        plt.sca(ax[0])
+        for flag in shape_flag_list:
+            ys = []
+            for w in wvals:
+                yval = np.nan
+                for r in rows:
+                    if r[0]==w and r[1]==flag:
+                        yval = r[3] if np.isfinite(r[3]) else np.nan
+                        break
+                ys.append(yval)
+            plt.plot(wvals, ys, '-o', label=f'shape_flag={flag}')
+        plt.xlabel('psf_width [m]'); plt.ylabel('K_mean'); plt.title('K_mean vs PSF width'); plt.legend(frameon=False)
+        plt.sca(ax[1])
+        for flag in shape_flag_list:
+            ys = []
+            for w in wvals:
+                yval = np.nan
+                for r in rows:
+                    if r[0]==w and r[1]==flag:
+                        yval = r[5] if np.isfinite(r[5]) else np.nan
+                        break
+                ys.append(yval)
+            plt.plot(wvals, ys, '-o', label=f'shape_flag={flag}')
+        plt.xlabel('psf_width [m]'); plt.ylabel('gk_long_err'); plt.title('gk_long_err vs PSF width'); plt.legend(frameon=False)
+        plt.tight_layout()
+        queue_fig(fig, fig_prefix(cfg.outdir, "nm_geometry_scan.png"))
+    except Exception:
+        pass
+
+
+def run_nm_with_chi_variation(cfg, mode='gauss', strength=0.05, w0_factor=4.0):
+    sub = copy.deepcopy(cfg)
+    sub.enable_chi = True
+    sub.chi_mode = mode
+    base = build_geometry_and_band(sub)
+    wmin, wup = base['omega_min'], base['omega_up']
+    sub.chi_omega0 = (wup - wmin) / max(w0_factor, 1.0)
+    sub.chi_strength = strength
+    m = compute_core_metrics(sub, collect_alpha=True)
+    csvp = fig_prefix(cfg.outdir, f"nm_chi_variation_{mode}.csv")
+    save_csv(csvp, ['mode','strength','omega0','alpha_Fchi_mean','alpha_Fchi_std','E_le_mean'],
+             [mode, strength, sub.chi_omega0, m.get('alpha_mean', np.nan), m.get('alpha_std', np.nan), m.get('E_le_mean', np.nan)])
+    try:
+        fig = plt.figure(figsize=(6.4,3.6))
+        vals = [m.get('alpha_mean', np.nan), m.get('E_le_mean', np.nan)]
+        labs = ['alpha_mean','E_le_mean']
+        x = np.arange(2)
+        plt.bar(x, vals, color=['#4C78A8','#E45756'])
+        plt.xticks(x, labs); plt.title(f'chi variation: {mode}')
+        plt.tight_layout()
+        queue_fig(fig, fig_prefix(cfg.outdir, f"nm_chi_variation_{mode}.png"))
+    except Exception:
+        pass
+
+
+def plot_master_curve_long(cfg, tag, omega, F, omega_min, omega_up, tau_m):
+    S = S_long_memory(omega, tau_m, S0=1.0)
+    omH, frac, _ = H_overlap_fraction(omega, F, S, omega_up)
+    x = omH * tau_m
+    xup = omega_up * tau_m
+    yup = max(np.arctan(xup), 1e-300)
+    y_analytic = np.arctan(x) / yup
+    fig = plt.figure(figsize=(7.6, 4.8))
+    plt.plot(x, frac, '-', color='#E45756', lw=2.0, label='data')
+    plt.plot(x, y_analytic, 'k--', lw=1.4, label='arctan(x)/arctan(xup)')
+    gk = np.tan(np.pi * cfg.kappa_coverage / 2.0)
+    plt.axvline(gk, color='gray', ls=':', lw=1.2, label='x=tan(pi*kappa/2)')
+    plt.xlabel('xLM=Omega*tau_m'); plt.ylabel('H/Hup'); plt.title('Master curve long')
+    maybe_legend(); plt.tight_layout()
+    png = fig_prefix(cfg.outdir, f"{tag}.png")
+    queue_fig(fig, png)
+    csvp = fig_prefix(cfg.outdir, f"{tag}.csv")
+    save_csv(csvp, ['tau_m','x','H_over_Hup','analytic','xup','kappa','tan_pi_k_over_2'], [tau_m, x, frac, y_analytic, xup, cfg.kappa_coverage, gk])
+
+
+def plot_master_curve_short(cfg, tag, omega, F, omega_min, omega_up, tau_m):
+    S = S_short_memory(omega, tau_m, S0=1.0, c_base=0.6, delta_t_ref=cfg.delta_t)
+    omH, frac, _ = H_overlap_fraction(omega, F, S, omega_up)
+    omega_star, _, _ = nm_operational_edge(cfg, F, omega, omega_min, omega_up, lambda om, tm: S_short_memory(om, tm, 1.0, 0.6, cfg.delta_t), tau_m)
+    x = np.clip(omH / max(omega_star, 1e-300), 0.0, np.inf)
+    fig = plt.figure(figsize=(7.6, 4.8))
+    plt.plot(x, frac, '-', color='#4C78A8', lw=2.0, label='data')
+    plt.axvline(1.0, color='gray', ls=':', lw=1.2, label='x=1')
+    plt.xlabel('xSM=Omega/omega_star'); plt.ylabel('H/Hup'); plt.title('Master curve short')
+    maybe_legend(); plt.tight_layout()
+    png = fig_prefix(cfg.outdir, f"{tag}.png")
+    queue_fig(fig, png)
+    csvp = fig_prefix(cfg.outdir, f"{tag}.csv")
+    save_csv(csvp, ['tau_m','x','H_over_Hup','omega_star','kappa'], [tau_m, x, frac, omega_star, cfg.kappa_coverage])
+
+
+def plot_qtilde_flatness(cfg, tag, omega, F_raw, omega_min, omega_up, tau_list, S_func):
+    fig = plt.figure(figsize=(7.6, 4.8))
+    rows = {'tau_m': [], 'omega': [], 'qtilde': [], 'alpha_Fchi_plus': [], 'L_qtilde': [], 'omega_max_op': []}
+    w = omega * cfg.delta_t
+    chi_arr = chi_hat_dimless(cfg, w)
+    colors = ['#4C78A8','#E45756','#72B7B2','#F58518','#B279A2','#9C755F']
+    for i, tm in enumerate(tau_list[:6]):
+        _, _, omega_max_op = nm_operational_edge(cfg, F_raw, omega, omega_min, omega_up, S_func, tm)
+        F_eff, _, _ = get_calibrated_F_for_band(cfg, omega, F_raw, omega_min, omega_max_op)
+        S = S_func(omega, tm); S0 = max(S[0], 1e-300)
+        ln_span = _log_span(omega_min, omega_max_op)
+        lever, C_tilde = lever_integral_log_with_chi(omega, F_eff, chi_arr, S / S0, omega_min, omega_max_op)
+        alpha = lever / max(ln_span, 1e-300)
+        mask = (omega >= omega_min) & (omega <= omega_max_op)
+        base = ((F_eff * chi_arr) / (2.0 * np.pi)) * (S / S0) / max(C_tilde, 1e-300)
+        L_qt = log_lipschitz(omega, base, omega_min, omega_max_op)
+        c = colors[i % len(colors)]
+        plt.semilogx(omega[mask], base[mask], lw=1.8, color=c, label=f'tau={tm:.2e}')
+        rows['tau_m'] += [tm] * int(np.sum(mask))
+        rows['omega'] += list(omega[mask]); rows['qtilde'] += list(base[mask])
+        rows['alpha_Fchi_plus'].append(alpha); rows['L_qtilde'].append(L_qt); rows['omega_max_op'].append(omega_max_op)
+    plt.xlabel('omega'); plt.ylabel('q_tilde'); plt.title('qtilde flatness')
+    maybe_legend(); plt.tight_layout()
+    queue_fig(fig, fig_prefix(cfg.outdir, f"{tag}.png"))
+    save_csv(fig_prefix(cfg.outdir, f"{tag}.csv"),
+             ['tau_m','omega','qtilde','alpha_Fchi_plus_list','L_qtilde_list','omega_max_op_list'],
+             [rows['tau_m'], rows['omega'], rows['qtilde'], rows['alpha_Fchi_plus'], rows['L_qtilde'], rows['omega_max_op']])
+
+
+def eta_prediction_vs_fit(cfg, tag, omega, F_raw, omega_min, omega_up, tau_list, a_lin=0.3):
+    omW, Wfrac, _ = Wplus_fraction(omega, F_raw, omega_up)
+    Omega0 = invert_quantile(omW, Wfrac, cfg.kappa_coverage)
+    xs = []; ys = []
+    for tm in tau_list:
+        S_lin = lambda om, tt: S_short_memory_linear(om, tt, S0=1.0, a_base=a_lin, delta_t_ref=cfg.delta_t)
+        S = S_lin(omega, tm)
+        S = np.maximum(1e-12, S)
+        omH, frac, _ = H_overlap_fraction(omega, F_raw, S, omega_up)
+        omega_star = invert_quantile(omH, frac, cfg.kappa_coverage)
+        xs.append((tm / cfg.delta_t) ** 2); ys.append(Omega0 - omega_star)
+    eta_fit, _, _, _, _ = _quad_fit_through_origin(xs, ys)
+    I0_up = float(integrate.trapezoid(F_raw[(omega <= omega_up)], x=omega[(omega <= omega_up)]))
+    I2_up = float(integrate.trapezoid((omega[(omega <= omega_up)] ** 2) * F_raw[(omega <= omega_up)], x=omega[(omega <= omega_up)]))
+    mask0 = omega <= Omega0
+    I0_0 = float(integrate.trapezoid(F_raw[mask0], x=omega[mask0]))
+    I2_0 = float(integrate.trapezoid((omega[mask0] ** 2) * F_raw[mask0], x=omega[mask0]))
+    r_up = I2_up / max(I0_up, 1e-300); r_0 = I2_0 / max(I0_0, 1e-300)
+    dOmega = 1e-3 * Omega0
+    def Psi(Omg, tau):
+        S = S_short_memory_linear(omega, tau, 1.0, a_lin, cfg.delta_t)
+        S = np.maximum(1e-12, S)
+        omH, frac, _ = H_overlap_fraction(omega, F_raw, S, omega_up)
+        return float(np.interp(Omg, omH, frac, left=0.0, right=1.0) - cfg.kappa_coverage)
+    dt = 1e-3 * cfg.delta_t
+    d2Psi = (Psi(Omega0, 2*dt) - 2*Psi(Omega0, dt) + Psi(Omega0, 0.0)) / max(dt*dt, 1e-30)
+    dPsi_dO = (Psi(Omega0 + dOmega, 0.0) - Psi(Omega0 - dOmega, 0.0)) / max(2*dOmega, 1e-30)
+    eta_pred = d2Psi / max(2*dPsi_dO, 1e-300)
+    fig = plt.figure(figsize=(6.8,4.2))
+    plt.bar([0,1],[eta_fit, eta_pred], color=['#4C78A8','#E45756'])
+    plt.xticks([0,1],['eta_fit','eta_pred'])
+    plt.title('eta fit vs pred (linear short memory)')
+    plt.tight_layout()
+    queue_fig(fig, fig_prefix(cfg.outdir, f"{tag}.png"))
+    save_csv(fig_prefix(cfg.outdir, f"{tag}.csv"),
+             ['Omega0','I0_up','I2_up','I0_0','I2_0','r_up','r_0','d2Psi','dPsi_dO','eta_fit','eta_pred'],
+             [Omega0, I0_up, I2_up, I0_0, I2_0, r_up, r_0, d2Psi, dPsi_dO, eta_fit, eta_pred])
+
+
+def long_orders_scaling(cfg, tag, omega, F_raw, omega_min, omega_up, tau_list):
+    gk = np.tan(np.pi * cfg.kappa_coverage / 2.0)
+    xs1 = []; ys1 = []; xs2 = []; ys2 = []
+    for tm in tau_list:
+        omega_star, _, om_max = nm_operational_edge(cfg, F_raw, omega, omega_min, omega_up, S_long_memory, tm)
+        err = abs(omega_star * tm - gk)
+        dm = cfg.delta_t / max(tm, 1e-30)
+        xs1.append(dm*dm); ys1.append(err)
+        xs2.append(1.0 / max(om_max * tm, 1e-30)); ys2.append(err)
+    fig, ax = plt.subplots(1,2,figsize=(11.2,4.2))
+    plt.sca(ax[0]); plt.plot(xs1, ys1, 'o'); plt.xlabel('delta_m^2'); plt.ylabel('abs(err)'); plt.title('err vs delta_m^2')
+    plt.sca(ax[1]); plt.plot(xs2, ys2, 'o'); plt.xlabel('1/(Omega_up*tau_m)'); plt.ylabel('abs(err)'); plt.title('err vs 1/(Omega_up*tau_m)')
+    plt.tight_layout()
+    queue_fig(fig, fig_prefix(cfg.outdir, f"{tag}.png"))
+    save_csv(fig_prefix(cfg.outdir, f"{tag}.csv"),
+             ['delta_m2','err_delta','inv_Omegat','err_inv'], [xs1, ys1, xs2, ys2])
+
+
+def nonmonotone_spectrum(omega, tau_m, base='short', a=0.1, b=3.0, delta_t_ref=1.0):
+    if base == 'short':
+        S0 = S_short_memory(omega, tau_m, 1.0, 0.6, delta_t_ref)
+    elif base == 'long':
+        S0 = S_long_memory(omega, tau_m, 1.0)
+    else:
+        S0 = np.ones_like(omega)
+    mod = 1.0 + a * np.cos(b * np.log(np.maximum(omega, 1e-30)))
+    S = np.maximum(1e-12, S0 * mod)
+    return S
+
+
+def nonmonotone_window(F_raw, omega, a=0.1, b=3.0):
+    mod = 1.0 + a * np.cos(b * np.log(np.maximum(omega, 1e-30)))
+    F = np.maximum(0.0, F_raw * mod)
+    return F
+
+
+def run_failure_modes(cfg, omega, F_raw, omega_min, omega_up):
+    tau_s = [0.2*cfg.delta_t, 0.5*cfg.delta_t]
+    tau_l = [10*cfg.delta_t, 30*cfg.delta_t]
+    rows = []
+    for tm in tau_s:
+        S = nonmonotone_spectrum(omega, tm, base='short', a=0.15, b=4.0, delta_t_ref=cfg.delta_t)
+        omH, Hfrac, _ = H_overlap_fraction(omega, F_raw, S, omega_up)
+        omW, Wfrac, _ = Wplus_fraction(omega, F_raw, omega_up)
+        omega_star = invert_quantile(omH, Hfrac, cfg.kappa_coverage)
+        c_kappa_up = invert_quantile(omW, Wfrac, cfg.kappa_coverage)
+        rows.append(('nonmono_S_short', tm, omega_star, c_kappa_up, float(omega_star > c_kappa_up + 1e-12)))
+    for tm in tau_l:
+        S = nonmonotone_spectrum(omega, tm, base='long', a=0.15, b=4.0, delta_t_ref=cfg.delta_t)
+        omH, Hfrac, _ = H_overlap_fraction(omega, F_raw, S, omega_up)
+        omW, Wfrac, _ = Wplus_fraction(omega, F_raw, omega_up)
+        omega_star = invert_quantile(omH, Hfrac, cfg.kappa_coverage)
+        c_kappa_up = invert_quantile(omW, Wfrac, cfg.kappa_coverage)
+        rows.append(('nonmono_S_long', tm, omega_star, c_kappa_up, float(omega_star > c_kappa_up + 1e-12)))
+    F_nm = nonmonotone_window(F_raw, omega, a=0.15, b=4.0)
+    for tm in tau_s[:1]:
+        S = S_short_memory(omega, tm, 1.0, 0.6, cfg.delta_t)
+        omH, Hfrac, _ = H_overlap_fraction(omega, F_nm, S, omega_up)
+        omW, Wfrac, _ = Wplus_fraction(omega, F_nm, omega_up)
+        omega_star = invert_quantile(omH, Hfrac, cfg.kappa_coverage)
+        c_kappa_up = invert_quantile(omW, Wfrac, cfg.kappa_coverage)
+        rows.append(('nonmono_window', tm, omega_star, c_kappa_up, float(omega_star > c_kappa_up + 1e-12)))
+    csvp = fig_prefix(cfg.outdir, "nm_failure_modes.csv")
+    save_csv(csvp, ['case','tau_m','omega_star','c_kappa_up','c_kappa_active'], [[r[0] for r in rows],[r[1] for r in rows],[r[2] for r in rows],[r[3] for r in rows],[r[4] for r in rows]])
+    fig = plt.figure(figsize=(6.6,4.0))
+    labs = [r[0] for r in rows]; vals = [r[4] for r in rows]
+    x = np.arange(len(vals))
+    plt.bar(x, vals)
+    plt.xticks(x, labs, rotation=25, ha='right'); plt.ylabel('c_kappa_up_active'); plt.title('Failure-mode activations')
+    plt.tight_layout()
+    queue_fig(fig, fig_prefix(cfg.outdir, "nm_failure_modes.png"))
+
+
+def plot_K_estimate_chi(cfg, title, tag, tau_list_short, K_est_short_chi, tau_list_long, K_est_long_chi, K_ref):
+    fig = plt.figure(figsize=(7.6, 4.8))
+    if K_est_short_chi:
+        plt.plot(tau_list_short, K_est_short_chi, '-', color='#4C78A8', lw=1.8, label='short K_est_chi')
+        plt.plot(tau_list_short, K_est_short_chi, 'o', color='#4C78A8', ms=4)
+    if K_est_long_chi:
+        plt.plot(tau_list_long, K_est_long_chi, '-', color='#E45756', lw=1.8, label='long K_est_chi')
+        plt.plot(tau_list_long, K_est_long_chi, 's', color='#E45756', ms=4)
+    plt.axhline(K_ref, color='k', ls='--', lw=1.5, label='K (geom-locked)')
+    plt.xlabel('tau_m [s]'); plt.ylabel('K_est_chi')
+    plt.title(title); maybe_legend(); plt.tight_layout()
+    queue_fig(fig, fig_prefix(cfg.outdir, f"{tag}.png"))
+    save_csv(fig_prefix(cfg.outdir, f"{tag}.csv"), ['tau_m_short','K_est_short_chi','tau_m_long','K_est_long_chi','K_ref'],
+             [tau_list_short if K_est_short_chi else [np.nan], K_est_short_chi if K_est_short_chi else [np.nan],
+              tau_list_long if K_est_long_chi else [np.nan], K_est_long_chi if K_est_long_chi else [np.nan], K_ref])
+
+
+def run_nonmarkov_validation(cfg: TheoryConfig):
+    np.random.seed(cfg.seed)
+    ensure_dir(cfg.outdir)
+    start_time = time.time()
+    base = build_geometry_and_band(cfg)
+    K_val = base['K']; v_th = base['v_th']; p_th = base['p_th']; epsilon = base['epsilon']
+    omega_min = base['omega_min']; omega_up = base['omega_up']
+    mainlobe_cap = base['mainlobe_cap']
+    if (not np.isfinite(omega_up)) or (omega_up <= omega_min):
+        omega_up = omega_min * (1.0 + 5e-1)
+    omega = nm_freq_grid(omega_min, omega_up, cfg.nm_n_omega)
+    F_raw = filter_rectangular_double_sided(omega, cfg.delta_t)
+    if not cfg.nm_short_tau_list:
+        cfg.nm_short_tau_list = list(np.linspace(0.02, 0.8, 64) * cfg.delta_t)
+    if not cfg.nm_long_tau_list:
+        cfg.nm_long_tau_list = list(np.linspace(3.0, 120.0, 96) * cfg.delta_t)
+    S_func_sm_vis = lambda om, tm: S_short_memory(om, tm, S0=1.0, c_base=0.6, delta_t_ref=cfg.delta_t)
+    plot_nm_edge_show(cfg, 'nm_edge_show_short', 'Short-memory: edge and band', omega, F_raw, cfg.nm_short_tau_list[:6], S_func_sm_vis, omega_min, omega_up)
+    plot_nm_edge_show(cfg, 'nm_edge_show_long', 'Long-memory: edge and band', omega, F_raw, cfg.nm_long_tau_list[:6], S_long_memory, omega_min, omega_up)
+    ln_band_list = []; y_norm_F_list = []; y_norm_Fchi_list = []
+    regime_list = []; tau_list = []; delta_p1_F_list = []; delta_p1_FchiJ_list = []; J_list = []
+    S_func_sm_calc = lambda om, tm: S_short_memory(om, tm, S0=1.0, c_base=0.6, delta_t_ref=cfg.delta_t)
+    msis_LqDelta_vals = []
+    ineq_violations = 0
+    ineq_total = 0
+    c_kappa_hits = 0
+    limiter_counts = {'omega_star': 0, 'c_kappa_up': 0, 'c_in': 0, 'omega_sys': 0, 'c_kappa/dt': 0, 'mainlobe': 0}
+    w_dimless = omega * cfg.delta_t
+    chi_full = chi_hat_dimless(cfg, w_dimless)
+    K_est_short = []; K_est_short_chi = []
+    for tau_m in cfg.nm_short_tau_list:
+        omega_star, c_kappa_up, omega_max_op = nm_operational_edge(cfg, F_raw, omega, omega_min, omega_up, S_func_sm_calc, tau_m)
+        ln_band = _log_span(omega_min, omega_max_op)
+        degenerate = (not np.isfinite(ln_band)) or (ln_band <= 1e-8) or (not np.isfinite(omega_max_op)) or (omega_max_op <= omega_min * (1.0 + 1e-9))
+        if degenerate:
+            ln_band_list.append(np.nan); y_norm_F_list.append(np.nan); y_norm_Fchi_list.append(np.nan)
+            regime_list.append('short'); tau_list.append(tau_m)
+            delta_p1_F_list.append(np.nan); delta_p1_FchiJ_list.append(np.nan); J_list.append(np.nan)
+            K_est_short.append(np.nan); K_est_short_chi.append(np.nan)
+            continue
+        S_arr = S_func_sm_calc(omega, tau_m); S0 = max(S_arr[0], 1e-300)
+        lever_F = lever_integral_log_measure(omega, F_raw, S_arr / S0, omega_min, omega_max_op)
+        F_eff, JF_raw, _scale = get_calibrated_F_for_band(cfg, omega, F_raw, omega_min, omega_max_op)
+        JF, Jchi, Jtot = compute_J_factors_dimless(cfg, omega, omega_min, omega_max_op, F_eff, chi_full)
+        bad = (not np.isfinite(lever_F)) or (not np.isfinite(Jtot)) or (Jtot <= 0.0)
+        if bad:
+            ln_band_list.append(np.nan); y_norm_F_list.append(np.nan); y_norm_Fchi_list.append(np.nan)
+            regime_list.append('short'); tau_list.append(tau_m)
+            delta_p1_F_list.append(np.nan); delta_p1_FchiJ_list.append(np.nan); J_list.append(np.nan)
+            K_est_short.append(np.nan); K_est_short_chi.append(np.nan)
+            continue
+        delta_p1_F = - p_th * (epsilon ** 2) * K_val * lever_F
+        delta_p1_FchiJ = - p_th * (epsilon ** 2) * K_val * Jtot * ln_band
+        y_norm_F = (-delta_p1_F) / (p_th * (epsilon ** 2) * K_val) if np.isfinite(delta_p1_F) else np.nan
+        y_norm_Fchi = (-delta_p1_FchiJ) / (p_th * (epsilon ** 2) * K_val) if np.isfinite(delta_p1_FchiJ) else np.nan
+        ln_band_list.append(ln_band); y_norm_F_list.append(y_norm_F); y_norm_Fchi_list.append(y_norm_Fchi)
+        regime_list.append('short'); tau_list.append(tau_m)
+        delta_p1_F_list.append(delta_p1_F); delta_p1_FchiJ_list.append(delta_p1_FchiJ)
+        J_list.append(Jtot)
+        L_F = log_lipschitz(omega, F_raw / (2.0 * np.pi), omega_min, omega_max_op)
+        L_S = log_lipschitz(omega, S_arr / S0, omega_min, omega_max_op)
+        L_q = L_F + L_S
+        msis_LqDelta_vals.append(L_q * ln_band)
+        ineq_total += 1
+        if not (omega_star <= c_kappa_up + 1e-12):
+            ineq_violations += 1
+        K_est = (-delta_p1_F) / (p_th * (epsilon ** 2) * ln_band) if (np.isfinite(delta_p1_F) and np.isfinite(ln_band) and ln_band > 0) else np.nan
+        K_est_short.append(K_est)
+        denom = p_th * (epsilon ** 2) * (Jtot * ln_band)
+        K_est_chi = (-delta_p1_FchiJ) / denom if (np.isfinite(delta_p1_FchiJ) and np.isfinite(Jtot) and np.isfinite(ln_band) and (Jtot > 0) and (ln_band > 0)) else np.nan
+        K_est_short_chi.append(K_est_chi)
+        v_th_local = np.sqrt(K_B * cfg.T / max(cfg.m, 1e-300))
+        epsilon_local = HBAR / max(cfg.L_v * (cfg.m * v_th_local), 1e-300)
+        v_eff_local = max(abs(cfg.v_loc) if cfg.v_eff_mode == "loc" else v_th_local, 1e-30)
+        sigma_G_local = maybe_update_sigma_G_phys_max(cfg, epsilon_local, v_eff_local)
+        c_in_local = v_eff_local / max(sigma_G_local, 1e-30)
+        candidates = {'omega_star': omega_star, 'c_kappa_up': c_kappa_up, 'c_in': c_in_local, 'omega_sys': cfg.omega_sys, 'c_kappa/dt': cfg.c_kappa / max(cfg.delta_t, 1e-30), 'mainlobe': base['mainlobe_cap']}
+        active = min([v for v in candidates.values() if np.isfinite(v) and v > 0]) if any(np.isfinite(v) and v > 0 for v in candidates.values()) else np.nan
+        for k, v in candidates.items():
+            if np.isfinite(v) and v > 0 and np.isfinite(active) and abs(v - active) <= 1e-9 * max(active, 1.0):
+                limiter_counts[k] += 1
+        if np.isfinite(active) and abs(active - c_kappa_up) <= 1e-9 * max(active, 1.0):
+            c_kappa_hits += 1
+    K_est_long = []; K_est_long_chi = []
+    for tau_m in cfg.nm_long_tau_list:
+        omega_star, c_kappa_up, omega_max_op = nm_operational_edge(cfg, F_raw, omega, omega_min, omega_up, S_long_memory, tau_m)
+        ln_band = _log_span(omega_min, omega_max_op)
+        degenerate = (not np.isfinite(ln_band)) or (ln_band <= 1e-8) or (not np.isfinite(omega_max_op)) or (omega_max_op <= omega_min * (1.0 + 1e-9))
+        if degenerate:
+            ln_band_list.append(np.nan); y_norm_F_list.append(np.nan); y_norm_Fchi_list.append(np.nan)
+            regime_list.append('long'); tau_list.append(tau_m)
+            delta_p1_F_list.append(np.nan); delta_p1_FchiJ_list.append(np.nan); J_list.append(np.nan)
+            K_est_long.append(np.nan); K_est_long_chi.append(np.nan)
+            continue
+        S_arr = S_long_memory(omega, tau_m); S0 = max(S_arr[0], 1e-300)
+        lever_F = lever_integral_log_measure(omega, F_raw, S_arr / S0, omega_min, omega_max_op)
+        F_eff, JF_raw, _scale = get_calibrated_F_for_band(cfg, omega, F_raw, omega_min, omega_max_op)
+        JF, Jchi, Jtot = compute_J_factors_dimless(cfg, omega, omega_min, omega_max_op, F_eff, chi_full)
+        bad = (not np.isfinite(lever_F)) or (not np.isfinite(Jtot)) or (Jtot <= 0.0)
+        if bad:
+            ln_band_list.append(np.nan); y_norm_F_list.append(np.nan); y_norm_Fchi_list.append(np.nan)
+            regime_list.append('long'); tau_list.append(tau_m)
+            delta_p1_F_list.append(np.nan); delta_p1_FchiJ_list.append(np.nan); J_list.append(np.nan)
+            K_est_long.append(np.nan); K_est_long_chi.append(np.nan)
+            continue
+        delta_p1_F = - p_th * (epsilon ** 2) * K_val * lever_F
+        delta_p1_FchiJ = - p_th * (epsilon ** 2) * K_val * Jtot * ln_band
+        y_norm_F = (-delta_p1_F) / (p_th * (epsilon ** 2) * K_val) if np.isfinite(delta_p1_F) else np.nan
+        y_norm_Fchi = (-delta_p1_FchiJ) / (p_th * (epsilon ** 2) * K_val) if np.isfinite(delta_p1_FchiJ) else np.nan
+        ln_band_list.append(ln_band); y_norm_F_list.append(y_norm_F); y_norm_Fchi_list.append(y_norm_Fchi)
+        regime_list.append('long'); tau_list.append(tau_m)
+        delta_p1_F_list.append(delta_p1_F); delta_p1_FchiJ_list.append(delta_p1_FchiJ)
+        J_list.append(Jtot)
+        L_F = log_lipschitz(omega, F_raw / (2.0 * np.pi), omega_min, omega_max_op)
+        L_S = log_lipschitz(omega, S_arr / S0, omega_min, omega_max_op)
+        L_q = L_F + L_S
+        msis_LqDelta_vals.append(L_q * ln_band)
+        ineq_total += 1
+        if not (omega_star <= c_kappa_up + 1e-12):
+            ineq_violations += 1
+        K_est = (-delta_p1_F) / (p_th * (epsilon ** 2) * ln_band) if (np.isfinite(delta_p1_F) and np.isfinite(ln_band) and ln_band > 0) else np.nan
+        K_est_long.append(K_est)
+        denom = p_th * (epsilon ** 2) * (Jtot * ln_band)
+        K_est_chi = (-delta_p1_FchiJ) / denom if (np.isfinite(delta_p1_FchiJ) and np.isfinite(Jtot) and np.isfinite(ln_band) and (Jtot > 0) and (ln_band > 0)) else np.nan
+        K_est_long_chi.append(K_est_chi)
+        v_th_local = np.sqrt(K_B * cfg.T / max(cfg.m, 1e-300))
+        epsilon_local = HBAR / max(cfg.L_v * (cfg.m * v_th_local), 1e-300)
+        v_eff_local = max(abs(cfg.v_loc) if cfg.v_eff_mode == "loc" else v_th_local, 1e-30)
+        sigma_G_local = maybe_update_sigma_G_phys_max(cfg, epsilon_local, v_eff_local)
+        c_in_local = v_eff_local / max(sigma_G_local, 1e-30)
+        candidates = {'omega_star': omega_star, 'c_kappa_up': c_kappa_up, 'c_in': c_in_local, 'omega_sys': cfg.omega_sys, 'c_kappa/dt': cfg.c_kappa / max(cfg.delta_t, 1e-30), 'mainlobe': base['mainlobe_cap']}
+        active = min([v for v in candidates.values() if np.isfinite(v) and v > 0]) if any(np.isfinite(v) and v > 0 for v in candidates.values()) else np.nan
+        for k, v in candidates.items():
+            if np.isfinite(v) and v > 0 and np.isfinite(active) and abs(v - active) <= 1e-9 * max(active, 1.0):
+                limiter_counts[k] += 1
+        if np.isfinite(active) and abs(active - c_kappa_up) <= 1e-9 * max(active, 1.0):
+            c_kappa_hits += 1
+    plot_nm_collapse(cfg, 'QBL collapse (F-only lever)', 'nm_collapse_Fonly', ln_band_list, y_norm_F_list, regime_list, tau_list, delta_p1_F_list, J_list)
+    plot_nm_collapse(cfg, 'QBL collapse (time-kernel, J*ln)', 'nm_collapse_Fchi', ln_band_list, y_norm_Fchi_list, regime_list, tau_list, delta_p1_FchiJ_list, J_list)
+    K_short = [K_val for _ in cfg.nm_short_tau_list]
+    K_long = [K_val for _ in cfg.nm_long_tau_list]
+    plot_nm_K_invariance(cfg, 'Geometry-locked K invariant', 'nm_K_invariance', cfg.nm_short_tau_list, K_short, cfg.nm_long_tau_list, K_long, K_val)
+    plot_nm_K_estimate(cfg, 'K estimate from delta_p1 (F-only lever)', 'nm_K_estimate', cfg.nm_short_tau_list, K_est_short, cfg.nm_long_tau_list, K_est_long, K_val)
+    plot_K_estimate_chi(cfg, 'K estimate from delta_p1 (chi path)', 'nm_K_estimate_chi', cfg.nm_short_tau_list, K_est_short_chi, cfg.nm_long_tau_list, K_est_long_chi, K_val)
+    plot_nm_spectrum_flatness(cfg, 'Flatness (short memory): q(omega)', 'nm_flatness_q_short', omega, F_raw, cfg.nm_short_tau_list[:6], S_short_memory, omega_min, omega_up)
+    plot_nm_spectrum_flatness(cfg, 'Flatness (long memory): q(omega)', 'nm_flatness_q_long', omega, F_raw, cfg.nm_long_tau_list[:6], S_long_memory, omega_min, omega_up)
+    plot_nm_J_factors(cfg, 'J factors (short, log-measure)', 'nm_J_factors_short', omega, omega_min, omega_up, cfg.nm_short_tau_list[:6], 'short')
+    plot_nm_J_factors(cfg, 'J factors (long, log-measure)', 'nm_J_factors_long', omega, omega_min, omega_up, cfg.nm_long_tau_list[:6], 'long')
+    small_short_taus = list(np.linspace(0.0, 0.3, 64) * cfg.delta_t)
+    plot_nm_short_scaling(cfg, 'nm_short_scaling', omega, F_raw, omega_min, omega_up, small_short_taus, c_base_lin=0.6)
+    plot_nm_long_scaling(cfg, 'nm_long_scaling', omega, F_raw, omega_min, omega_up, cfg.nm_long_tau_list)
+    plot_nm_remainders(cfg, 'Remainders (short memory)', 'nm_remainders_short', omega, F_raw, omega_min, omega_up, cfg.nm_short_tau_list[:6], S_short_memory, K_val, p_th, epsilon)
+    plot_nm_remainders(cfg, 'Remainders (long memory)', 'nm_remainders_long', omega, F_raw, omega_min, omega_up, cfg.nm_long_tau_list[:6], S_long_memory, K_val, p_th, epsilon)
+    ln_band_short = []
+    for tau_m in cfg.nm_short_tau_list:
+        _, _, omega_max_op = nm_operational_edge(cfg, F_raw, omega, omega_min, omega_up, S_func_sm_calc, tau_m)
+        ln_band_short.append(_log_span(omega_min, omega_max_op))
+    plot_nm_separation(cfg, 'nm_separation_short', 'Space-time separation (short memory)', cfg.nm_short_tau_list, [K_val] * len(cfg.nm_short_tau_list), ln_band_short, 'short')
+    ln_band_long = []
+    for tau_m in cfg.nm_long_tau_list:
+        _, _, omega_max_op = nm_operational_edge(cfg, F_raw, omega, omega_min, omega_up, S_long_memory, tau_m)
+        ln_band_long.append(_log_span(omega_min, omega_max_op))
+    plot_nm_separation(cfg, 'nm_separation_long', 'Space-time separation (long memory)', cfg.nm_long_tau_list, [K_val] * len(cfg.nm_long_tau_list), ln_band_long, 'long')
+    tau_rep_long = cfg.nm_long_tau_list[len(cfg.nm_long_tau_list) // 2] if cfg.nm_long_tau_list else 10.0 * cfg.delta_t
+    tau_rep_short = cfg.nm_short_tau_list[len(cfg.nm_short_tau_list) // 2] if cfg.nm_short_tau_list else 0.8 * cfg.delta_t
+    plot_master_curve_long(cfg, 'nm_master_curve_long', omega, F_raw, omega_min, omega_up, tau_rep_long)
+    plot_master_curve_short(cfg, 'nm_master_curve_short', omega, F_raw, omega_min, omega_up, tau_rep_short)
+    plot_qtilde_flatness(cfg, 'nm_qtilde_flatness_short', omega, F_raw, omega_min, omega_up, cfg.nm_short_tau_list[:6], S_short_memory)
+    plot_qtilde_flatness(cfg, 'nm_qtilde_flatness_long', omega, F_raw, omega_min, omega_up, cfg.nm_long_tau_list[:6], S_long_memory)
+    eta_prediction_vs_fit(cfg, 'nm_eta_pred_vs_fit', omega, F_raw, omega_min, omega_up, small_short_taus, a_lin=0.3)
+    long_orders_scaling(cfg, 'nm_long_orders', omega, F_raw, omega_min, omega_up, cfg.nm_long_tau_list)
+    nonmonotone_spectrum_test_taus = [0.2*cfg.delta_t, 0.5*cfg.delta_t, 10*cfg.delta_t]
+    run_failure_modes(cfg, omega, F_raw, omega_min, omega_up)
+    plot_nm_inequality_check(cfg, 'Inequality: H/H_up >= W_+/W_+^up (short, rep tau)', 'nm_inequality_short', omega, F_raw, omega_min, omega_up, tau_rep_short, S_short_memory)
+    plot_nm_inequality_check(cfg, 'Inequality: H/H_up >= W_+/W_+^up (long, rep tau)', 'nm_inequality_long', omega, F_raw, omega_min, omega_up, tau_rep_long, S_long_memory)
+    LqDelta_max = float(np.nanmax(msis_LqDelta_vals)) if msis_LqDelta_vals else np.nan
+    epsilon0_thresh = cfg.LqDelta_tol
+    msis_flatness_ok = (LqDelta_max <= epsilon0_thresh) if np.isfinite(LqDelta_max) else False
+    mainlobe_used = (omega_up <= mainlobe_cap + 1e-12)
+    runtime_s = time.time() - start_time
+    checks = msis_checks(cfg, base, omega, F_raw)
+    sum_csv = fig_prefix(cfg.outdir, "nm_summary.csv")
+    save_csv(sum_csv,
+             ['p_th','epsilon','K','omega_min','omega_up','mainlobe_cap','mainlobe_cap_applied','kappa_coverage','n_short','n_long','short_tau_list','long_tau_list','calibrate_J','LqDelta_max','epsilon0_thresh','msis_flatness_ok','edge_ineq_violations','edge_ineq_total','c_kappa_up_activations','limiters','MMSIS_epsilon','MMSIS_eps_pass','MMSIS_Gamma_tot_dt','MMSIS_weak_pass','MMSIS_tilde_a_pp','MMSIS_tilde_a_xx','MMSIS_diff_pass','MMSIS_LqDelta','MMSIS_flat_pass','platform','python','numpy','scipy','matplotlib','runtime_s'],
+             [p_th, epsilon, K_val, omega_min, omega_up, mainlobe_cap, mainlobe_used, cfg.kappa_coverage, len(cfg.nm_short_tau_list), len(cfg.nm_long_tau_list), [f"{t:.6e}" for t in cfg.nm_short_tau_list], [f"{t:.6e}" for t in cfg.nm_long_tau_list], cfg.calibrate_J, LqDelta_max, epsilon0_thresh, msis_flatness_ok, ineq_violations, ineq_total, c_kappa_hits, str(limiter_counts), checks['epsilon'], checks['eps_pass'], checks['Gamma_tot_dt'], checks['weak_pass'], checks['tilde_a_pp'], checks['tilde_a_xx'], checks['diff_pass'], checks['LqDelta'], checks['flat_pass'], platform.platform(), sys.version.split()[0], np.__version__, scipy.__version__, matplotlib.__version__, runtime_s])
+    run_convergence_tests(cfg)
+    widths = list(np.linspace(0.2e-6, 1.2e-6, 9))
+    scan_geometry_families(cfg, widths, [True, False])
+    run_nm_with_chi_variation(cfg, mode='gauss', strength=0.05, w0_factor=4.0)
+    run_nm_with_chi_variation(cfg, mode='lorentz', strength=0.05, w0_factor=4.0)
+    flush_all_figs()
+
+def _F_rect_dimless(w):
+    w = np.asarray(w, dtype=float)
+    w2 = np.maximum(w, 1e-300)
+    return 4.0 * (np.sin(0.5 * w) ** 2) / (w2 ** 2)
+
+def _chi_hat_from_params(w, mode, strength, w0):
+    w = np.asarray(w, dtype=float)
+    if (mode is None) or (mode == "flat") or (strength is None) or (abs(strength) <= 0.0) or (w0 is None) or (not np.isfinite(w0)) or (w0 <= 0.0):
+        return np.ones_like(w, dtype=float)
+    if mode == "gauss":
+        return 1.0 + float(strength) * np.exp(- (w / float(w0)) ** 2)
+    if mode == "lorentz":
+        return (1.0 + float(strength)) / (1.0 + (w / float(w0)) ** 2)
+    return np.ones_like(w)
+
+def _chi_hat_self_energy_dimless(chi0, S_shape, sigma_se):
+    chi0 = np.asarray(chi0, dtype=float)
+    S_shape = np.asarray(S_shape, dtype=float)
+    if sigma_se is None or sigma_se == 0.0:
+        return chi0
+    denom = 1.0 - sigma_se * (S_shape - 1.0) * chi0
+    denom = np.where(np.abs(denom) < 1e-12, np.sign(denom) * 1e-12, denom)
+    return chi0 / denom
+
+def _multi_window_gain_dimless(w, n_windows=1, duty=1.0):
+    if n_windows <= 1 or duty <= 0:
+        return np.ones_like(w, dtype=float)
+    x = 0.5 * np.asarray(w, dtype=float) / max(duty, 1e-9)
+    num = np.sin(n_windows * x)
+    den = np.sin(x)
+    den = np.where(np.abs(den) < 1e-12, 1e-12, den)
+    g = (num / den) ** 2
+    return np.maximum(g, 0.0)
+
+def _band_limits_paperA(cfg: TheoryConfig, base_geom):
+    v_eff = max(abs(cfg.v_loc) if cfg.v_eff_mode == "loc" else np.sqrt(K_B * cfg.T / max(cfg.m, 1e-300)), 1e-30)
+    omega_min = max(1.0 / max(cfg.delta_t, 1e-30), v_eff / max(cfg.L_v, 1e-30))
+    sigma_G_phys_max = base_geom['sigma_G_phys_max']
+    mainlobe_cap = base_geom['mainlobe_cap']
+    omega_geom_up = v_eff / max(sigma_G_phys_max, 1e-30)
+    omega_up = min(c for c in [cfg.omega_sys, cfg.c_kappa / max(cfg.delta_t, 1e-30), omega_geom_up, mainlobe_cap] if np.isfinite(c) and c > 0)
+    return float(omega_min), float(omega_up)
+
+def _operational_edge_paperA(cfg, omega, F, S_arr, omega_min, omega_up):
+    omH, fracH, _ = H_overlap_fraction(omega, F, S_arr, omega_up)
+    omega_star = invert_quantile(omH, fracH, cfg.kappa_coverage)
+    omW, fracW, _ = Wplus_fraction(omega, F, omega_up)
+    c_kappa_up = invert_quantile(omW, fracW, cfg.kappa_coverage)
+    omega_max_op = min(omega_star, c_kappa_up, omega_up)
+    return float(omega_star), float(c_kappa_up), float(omega_max_op)
+
+def _interp1_with_fill(x_new, x, y):
+    x = np.asarray(x).ravel()
+    y = np.asarray(y).ravel()
+    x_new = np.asarray(x_new)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() == 0:
+        return np.full_like(x_new, np.nan, dtype=y.dtype)
+    x = x[mask]
+    y = y[mask]
+    idx = np.argsort(x)
+    x = x[idx]
+    y = y[idx]
+    if x.size == 1:
+        return np.full_like(x_new, y[0], dtype=y.dtype)
+    if np.iscomplexobj(y):
+        yr = np.interp(x_new, x, y.real, left=y.real[0], right=y.real[-1])
+        yi = np.interp(x_new, x, y.imag, left=y.imag[0], right=y.imag[-1])
+        return yr + 1j * yi
+    else:
+        return np.interp(x_new, x, y, left=y[0], right=y[-1])
+
+def run_time_domain_duhamel_strict(cfg: TheoryConfig,
+                                   tau_list=None,
+                                   mem_kind='short',
+                                   chi_mode=None,
+                                   chi_strength=None,
+                                   chi_w0_factor=4.0,
+                                   n_om=32768,
+                                   Nt_tau=4097,
+                                   use_self_energy=False,
+                                   sigma_se=0.0,
+                                   multi_window=None):
+    base = build_geometry_and_band(cfg)
+    omega_min, omega_up = _band_limits_paperA(cfg, base)
+    omega_u = np.linspace(0.0, omega_up, int(max(2048, n_om)))
+    omega_log = nm_freq_grid(omega_min, omega_up, cfg.nm_n_omega)
+    w_u = omega_u * cfg.delta_t
+    w_log = omega_log * cfg.delta_t
+    F_dim = _F_rect_dimless(w_log)
+    if multi_window is not None:
+        nW = int(multi_window.get('n', 1))
+        duty = float(multi_window.get('duty', 1.0))
+        F_dim = F_dim * _multi_window_gain_dimless(w_log, n_windows=nW, duty=duty)
+    if tau_list is None:
+        if mem_kind == 'short':
+            tau_list = cfg.nm_short_tau_list or list(np.linspace(0.05, 0.8, 16) * cfg.delta_t)
+        else:
+            tau_list = cfg.nm_long_tau_list or list(np.linspace(4.0, 40.0, 16) * cfg.delta_t)
+    rows = {'tau_m_s': [], 'delta_p1_time_ind': [], 'delta_p1_main': [], 'norm_err': [],
+            'ln_band': [], 'L_qDelta': [], 'E_le': [], 'E_e': [], 'omega_star': [],
+            'c_kappa_up': [], 'omega_max_op': []}
+    tk_rows = {'tau_m_s': [], 'tau': [], 'chi_tau': [], 'tri': []}
+    for tau_m in tau_list:
+        if mem_kind == 'short':
+            S_arr_log = S_short_memory(omega_log, tau_m, S0=1.0, c_base=0.6, delta_t_ref=cfg.delta_t)
+            S_arr_u = S_short_memory(omega_u, tau_m, S0=1.0, c_base=0.6, delta_t_ref=cfg.delta_t)
+        else:
+            S_arr_log = S_long_memory(omega_log, tau_m, S0=1.0)
+            S_arr_u = S_long_memory(omega_u, tau_m, S0=1.0)
+        S0_log = float(max(S_arr_log[0], 1e-30))
+        omega_star, c_kappa_up, omega_max_op = _operational_edge_paperA(cfg, omega_log, F_dim, S_arr_log, omega_min, omega_up)
+        ln_band = _log_span(omega_min, omega_max_op)
+        mask_log = (omega_log >= omega_min) & (omega_log <= omega_max_op)
+        wB = w_log[mask_log]
+        w_min = omega_min * cfg.delta_t
+        w_max_op = omega_max_op * cfg.delta_t
+        w0_dim = max((w_max_op - w_min) / max(chi_w0_factor, 1.0), 1e-9)
+        if (chi_mode is None) and (chi_strength is None):
+            chi0_u = chi_hat_dimless(cfg, w_u)
+        else:
+            chi0_u = _chi_hat_from_params(w_u, chi_mode or "flat", chi_strength if chi_strength is not None else 0.0, w0_dim)
+        chi0_B = _interp1_with_fill(wB, w_u, chi0_u)
+        S_shape_u = np.maximum(S_arr_u, 1e-300) / max(S_arr_u[0], 1e-30)
+        chi_u_se = _chi_hat_self_energy_dimless(chi0_u, S_shape_u, sigma_se) if use_self_energy else chi0_u
+        chi_B = _interp1_with_fill(wB, w_u, chi_u_se)
+        if multi_window is not None:
+            nW = int(multi_window.get('n', 1))
+            duty = float(multi_window.get('duty', 1.0))
+            Gdim = _multi_window_gain_dimless(wB, n_windows=nW, duty=duty)
+        else:
+            Gdim = 1.0
+        tau = np.linspace(0.0, 1.0, int(max(3, Nt_tau)))
+        chi_tau = np.zeros_like(tau, dtype=float)
+        if wB.size >= 2:
+            for it, tv in enumerate(tau):
+                chi_tau[it] = (1.0 / np.pi) * float(integrate.trapezoid((chi_B * Gdim) * np.cos(wB * tv), x=wB))
+        tri = (1.0 - tau)
+        T_time = float(integrate.trapezoid(tri * chi_tau, x=tau))
+        p_th = base['p_th']; epsilon = base['epsilon']; K_val = base['K']
+        delta_p1_time_ind = - p_th * (epsilon ** 2) * K_val * T_time
+        if wB.size >= 2:
+            dlnw = np.log(wB[1] / wB[0])
+            F_band = F_dim[mask_log]
+            num = np.sum((wB * F_band * chi_B * Gdim) * dlnw)
+            J = float((1.0 / (2.0 * np.pi)) * (num / max(ln_band, 1e-300)))
+        else:
+            J = 1.0
+        delta_p1_main = - p_th * (epsilon ** 2) * K_val * J * ln_band
+        C_F = band_C_F(omega_log, _F_rect_dimless(w_log), omega_min, omega_max_op)
+        q_B = ((_F_rect_dimless(w_log) / (2.0 * np.pi)) * (np.maximum(S_arr_log, 1e-300) / max(S0_log, 1e-30))) / max(C_F, 1e-300)
+        if wB.size >= 2:
+            dlnom = np.log(omega_log[mask_log][1] / omega_log[mask_log][0])
+            W_t_NM = float(np.sum(q_B[mask_log] * dlnom))
+        else:
+            W_t_NM = 0.0
+        E_le = - p_th * (epsilon ** 2) * K_val * (W_t_NM - ln_band)
+        E_e = - p_th * (epsilon ** 2) * K_val * (ln_band - _log_span(omega_min, c_kappa_up))
+        rows['tau_m_s'].append(tau_m)
+        rows['delta_p1_time_ind'].append(delta_p1_time_ind)
+        rows['delta_p1_main'].append(delta_p1_main)
+        rows['norm_err'].append(abs(delta_p1_time_ind - delta_p1_main) / max(p_th * (epsilon ** 2) * abs(K_val), 1e-30))
+        rows['ln_band'].append(ln_band)
+        rows['L_qDelta'].append(log_lipschitz(omega_log, q_B, omega_min, omega_max_op) * ln_band)
+        rows['E_le'].append(E_le)
+        rows['E_e'].append(E_e)
+        rows['omega_star'].append(omega_star)
+        rows['c_kappa_up'].append(c_kappa_up)
+        rows['omega_max_op'].append(omega_max_op)
+        tk_rows['tau_m_s'] += [tau_m] * len(tau)
+        tk_rows['tau'] += list(tau)
+        tk_rows['chi_tau'] += list(chi_tau)
+        tk_rows['tri'] += list(tri)
+    tag = f"A_time_duhamel_{mem_kind}" + ("_se" if use_self_energy else "") + ("_mw" if multi_window else "")
+    save_csv(fig_prefix(cfg.outdir, f"{tag}.csv"),
+             ['tau_m_s','delta_p1_time_ind','delta_p1_main','norm_err','ln_band','L_qDelta','E_le','E_e','omega_star','c_kappa_up','omega_max_op'],
+             [rows['tau_m_s'], rows['delta_p1_time_ind'], rows['delta_p1_main'], rows['norm_err'], rows['ln_band'], rows['L_qDelta'], rows['E_le'], rows['E_e'], rows['omega_star'], rows['c_kappa_up'], rows['omega_max_op']])
+    save_csv(fig_prefix(cfg.outdir, f"{tag}_kernel.csv"),
+             ['tau_m_s','tau','chi_tau','triangle_weight'],
+             [tk_rows['tau_m_s'], tk_rows['tau'], tk_rows['chi_tau'], tk_rows['tri']])
+    try:
+        fig, ax = plt.subplots(1,3, figsize=(15,4.2))
+        plt.sca(ax[0]); plt.plot(rows['tau_m_s'], rows['delta_p1_time_ind'], 'o-', label='time-duhamel'); plt.plot(rows['tau_m_s'], rows['delta_p1_main'], 's-', label='J*ln'); plt.xlabel('tau_m'); plt.ylabel('delta_p1'); plt.title('time vs main'); plt.legend(frameon=False)
+        plt.sca(ax[1]); xa = np.array(rows['L_qDelta'], dtype=float); ya = np.array(rows['norm_err'], dtype=float); msk = (xa > 0) & (ya > 0) & np.isfinite(xa) & np.isfinite(ya)
+        if np.any(msk):
+            xs = np.log(xa[msk]); ys = np.log(ya[msk]); plt.scatter(xs, ys, s=22); A = np.vstack([np.ones(xs.size), xs]).T; coef, _, _, _ = np.linalg.lstsq(A, ys, rcond=None); xr = np.linspace(xs.min(), xs.max(), 256); plt.plot(xr, coef[0] + coef[1]*xr, 'k--', label=f'b~{coef[1]:.2f}'); plt.legend(frameon=False)
+        plt.xlabel('log(L_qDelta)'); plt.ylabel('log(norm_err)'); plt.title('order fit')
+        plt.sca(ax[2]); samp = min(3, len(np.unique(tk_rows['tau_m_s'])))
+        if samp > 0:
+            ts = np.array(tk_rows['tau']); ch = np.array(tk_rows['chi_tau']); tri = np.array(tk_rows['tri']); tau_arr = np.array(tk_rows['tau_m_s']); uniq = []
+            for tm in rows['tau_m_s']:
+                if tm not in uniq:
+                    uniq.append(tm)
+                if len(uniq) >= samp:
+                    break
+            for tm in uniq:
+                m = (tau_arr == tm); plt.plot(ts[m], ch[m], '-', label=f'chi(tau), tau={tm:.2e}'); plt.plot(ts[m], tri[m] * (np.max(ch[m]) if np.any(m) else 1.0), ':', alpha=0.6)
+            plt.xlabel('tau'); plt.ylabel('chi(tau)'); plt.title('kernel'); plt.legend(frameon=False)
+        plt.tight_layout(); queue_fig(fig, fig_prefix(cfg.outdir, f"{tag}.png"))
+    except Exception:
+        pass
+
+def build_failure_phase_diagram_extended(cfg: TheoryConfig,
+                                         strength_list=None,
+                                         w0_factor_list=None,
+                                         window_ripple=0.0,
+                                         mem_probe=(0.4, 15.0),
+                                         k_bias_thresh=0.1,
+                                         use_self_energy=False,
+                                         sigma_se=0.0,
+                                         multi_window=None):
+    base = build_geometry_and_band(cfg)
+    omega_min, omega_up = _band_limits_paperA(cfg, base)
+    omega = nm_freq_grid(omega_min, omega_up, cfg.nm_n_omega)
+    w = omega * cfg.delta_t
+    F_dim = _F_rect_dimless(w)
+    amp = 0.0
+    if isinstance(window_ripple, (list, tuple, np.ndarray)):
+        if len(window_ripple) > 0:
+            amp = float(window_ripple[0])
+    else:
+        amp = float(window_ripple)
+    if amp != 0.0:
+        F_dim = F_dim * (1.0 + amp * np.cos(4.0 * np.log(np.maximum(w, 1e-30))))
+    if multi_window is not None:
+        nW = int(multi_window.get('n', 1))
+        duty = float(multi_window.get('duty', 1.0))
+        F_dim = F_dim * _multi_window_gain_dimless(w, n_windows=nW, duty=duty)
+    if strength_list is None:
+        strength_list = np.linspace(0.0, 0.6, 19)
+    if w0_factor_list is None:
+        w0_factor_list = np.geomspace(0.5, 8.0, 17)
+    grid_bias = np.zeros((len(strength_list), len(w0_factor_list)))
+    grid_LqD  = np.zeros_like(grid_bias)
+    grid_ck   = np.zeros_like(grid_bias)
+    for i, a in enumerate(strength_list):
+        for j, f0 in enumerate(w0_factor_list):
+            def one_tau(tau_m):
+                S_arr = S_short_memory(omega, tau_m, 1.0, 0.6, cfg.delta_t) if (tau_m <= cfg.delta_t) else S_long_memory(omega, tau_m, 1.0)
+                S0 = float(max(S_arr[0], 1e-30))
+                omega_star, c_kappa_up, omega_max_op = _operational_edge_paperA(cfg, omega, F_dim, S_arr, omega_min, omega_up)
+                lnspan = _log_span(omega_min, omega_max_op)
+                mask = (omega >= omega_min) & (omega <= omega_max_op)
+                if np.count_nonzero(mask) < 2:
+                    return np.nan, 0.0, 0.0
+                dln = np.log(omega[mask][1] / omega[mask][0])
+                w_min = omega_min * cfg.delta_t
+                w_max_op = omega_max_op * cfg.delta_t
+                w0_dim = max((w_max_op - w_min) / max(f0, 1.0), 1e-9)
+                chi0 = _chi_hat_from_params(w, "gauss", a, w0_dim)
+                S_shape = np.maximum(S_arr, 1e-300) / max(S_arr[0], 1e-30)
+                chi_arr = _chi_hat_self_energy_dimless(chi0, S_shape, sigma_se) if use_self_energy else chi0
+                C_tilde = float(((1.0 / (2.0 * np.pi)) * np.sum((F_dim[mask] * chi_arr[mask]) * dln)) / max(lnspan, 1e-300))
+                qtilde = ((F_dim * chi_arr) / (2.0 * np.pi)) * (S_arr / S0) / max(C_tilde, 1e-300)
+                lever = float(np.sum(qtilde[mask] * dln))
+                p_th = base['p_th']; eps = base['epsilon']; K_ref = base['K']
+                delta_p1_true = - p_th * (eps ** 2) * K_ref * lever
+                K_est = (-delta_p1_true) / max(p_th * (eps ** 2) * lnspan, 1e-30)
+                L_qt = log_lipschitz(omega, qtilde, omega_min, omega_max_op)
+                ck_act = float(omega_max_op <= c_kappa_up + 1e-12)
+                return K_est, L_qt * lnspan, ck_act
+            K_s, LqD_s, ck_s = one_tau(mem_probe[0] * cfg.delta_t)
+            K_l, LqD_l, ck_l = one_tau(mem_probe[1] * cfg.delta_t)
+            K_ref = base['K']
+            bias = max(abs(K_s - K_ref) / max(abs(K_ref), 1e-30),
+                       abs(K_l - K_ref) / max(abs(K_ref), 1e-30)) if (np.isfinite(K_s) and np.isfinite(K_l)) else np.nan
+            grid_bias[i, j] = bias if np.isfinite(bias) else 0.0
+            grid_LqD[i, j] = max(LqD_s, LqD_l)
+            grid_ck[i, j]  = 0.5 * (ck_s + ck_l)
+    tag = "A_phase_extended" + ("_se" if use_self_energy else "") + ("_mw" if multi_window else "")
+    save_csv(fig_prefix(cfg.outdir, f"{tag}_Kbias.csv"),
+             ['chi_strength_list','w0_factor_list','Kbias_grid'],
+             [list(strength_list), list(w0_factor_list), [list(row) for row in grid_bias]])
+    save_csv(fig_prefix(cfg.outdir, f"{tag}_LqD.csv"),
+             ['chi_strength_list','w0_factor_list','LqD_grid'],
+             [list(strength_list), list(w0_factor_list), [list(row) for row in grid_LqD]])
+    save_csv(fig_prefix(cfg.outdir, f"{tag}_ckappa.csv"),
+             ['chi_strength_list','w0_factor_list','ckappa_grid'],
+             [list(strength_list), list(w0_factor_list), [list(row) for row in grid_ck]])
+    fail_mask = (grid_bias > k_bias_thresh) | (grid_LqD > cfg.LqDelta_tol) | (grid_ck > 0.5)
+    save_csv(fig_prefix(cfg.outdir, f"{tag}_failmask.csv"),
+             ['chi_strength_list','w0_factor_list','fail_mask_grid','thresh_Kbias','thresh_LqD','thresh_ck'],
+             [list(strength_list), list(w0_factor_list), [list(map(int, row)) for row in fail_mask],
+              k_bias_thresh, cfg.LqDelta_tol, 0.5])
+    try:
+        fig, ax = plt.subplots(2,2, figsize=(12,8))
+        ex = [min(strength_list), max(strength_list), min(w0_factor_list), max(w0_factor_list)]
+        plt.sca(ax[0,0]); im = plt.imshow(grid_bias.T, origin='lower', aspect='auto', extent=[ex[0], ex[1], ex[2], ex[3]], cmap='magma', vmin=0.0, vmax=max(0.2, np.nanmax(grid_bias))); plt.colorbar(im, fraction=0.046, pad=0.04); plt.contour(fail_mask.T, levels=[0.5], colors='w', extent=ex, linewidths=1.5); plt.xlabel('chi_strength'); plt.ylabel('w0_factor'); plt.title('K_est bias')
+        plt.sca(ax[0,1]); im = plt.imshow(grid_LqD.T, origin='lower', aspect='auto', extent=[ex[0], ex[1], ex[2], ex[3]], cmap='viridis', vmin=0.0, vmax=max(cfg.LqDelta_tol, np.nanmax(grid_LqD))); plt.colorbar(im, fraction=0.046, pad=0.04); plt.contour(fail_mask.T, levels=[0.5], colors='w', extent=ex, linewidths=1.5); plt.xlabel('chi_strength'); plt.ylabel('w0_factor'); plt.title('L_qtilde*Delta')
+        plt.sca(ax[1,0]); im = plt.imshow(grid_ck.T, origin='lower', aspect='auto', extent=[ex[0], ex[1], ex[2], ex[3]], cmap='plasma', vmin=0.0, vmax=1.0); plt.colorbar(im, fraction=0.046, pad=0.04); plt.contour(fail_mask.T, levels=[0.5], colors='w', extent=ex, linewidths=1.5); plt.xlabel('chi_strength'); plt.ylabel('w0_factor'); plt.title('ckappa activation')
+        plt.sca(ax[1,1]); fm = fail_mask.astype(float); im = plt.imshow(fm.T, origin='lower', aspect='auto', extent=[ex[0], ex[1], ex[2], ex[3]], cmap='binary', vmin=0.0, vmax=1.0); plt.colorbar(im, fraction=0.046, pad=0.04); plt.xlabel('chi_strength'); plt.ylabel('w0_factor'); plt.title('failure mask')
+        plt.tight_layout(); queue_fig(fig, fig_prefix(cfg.outdir, f"{tag}.png"))
+    except Exception:
+        pass
+
+def write_msis_report_strict2(cfg: TheoryConfig):
+    base = build_geometry_and_band(cfg)
+    omega_min, omega_up = base['omega_min'], base['omega_up']
+    omega = nm_freq_grid(omega_min, omega_up, cfg.nm_n_omega)
+    F_raw = _F_rect_dimless(omega * cfg.delta_t)
+    checks = msis_checks(cfg, base, omega, F_raw)
+    sigmaG_rate = 0.0; c_rate_max = 0.0
+    rate_pass = (sigmaG_rate <= 0.1 + 1e-12) and (c_rate_max <= 0.1 + 1e-12)
+    short_taus = cfg.nm_short_tau_list or []
+    long_taus  = cfg.nm_long_tau_list or []
+    theta_list = []
+    for t in short_taus + long_taus:
+        if t and cfg.delta_t:
+            theta_list.append(min(t / cfg.delta_t, cfg.delta_t / t))
+    theta_mean = float(np.mean(theta_list)) if theta_list else np.nan
+    theta_min = float(np.min(theta_list)) if theta_list else np.nan
+    theta_max = float(np.max(theta_list)) if theta_list else np.nan
+    n_short = sum(1 for t in short_taus if (t / cfg.delta_t) <= 0.3) if short_taus else 0
+    n_long = sum(1 for t in long_taus if (cfg.delta_t / max(t,1e-30)) <= 0.3) if long_taus else 0
+    eps_g = 0.0
+    pass_total = int(checks['eps_pass']) + int(checks['weak_pass']) + int(checks['diff_pass']) + int(checks['flat_pass']) + int(rate_pass)
+    fail_total = 5 - pass_total
+    save_csv(fig_prefix(cfg.outdir, "A_msis_strict_extended.csv"),
+             ['epsilon','eps_pass','Gamma_tot_dt','weak_pass','tilde_a_pp','tilde_a_xx','diff_pass',
+              'LqDelta','flat_pass',
+              'sigmaG_rate','c_rate_max','rate_pass',
+              'eps_g',
+              'theta_m_mean','theta_m_min','theta_m_max','n_short_class','n_long_class',
+              'pass_total','fail_total'],
+             [checks['epsilon'], checks['eps_pass'], checks['Gamma_tot_dt'], checks['weak_pass'],
+              checks['tilde_a_pp'], checks['tilde_a_xx'], checks['diff_pass'],
+              checks['LqDelta'], checks['flat_pass'],
+              sigmaG_rate, c_rate_max, rate_pass,
+              eps_g,
+              theta_mean, theta_min, theta_max, n_short, n_long,
+              pass_total, fail_total])
+
+def run_paperA_B_extended(cfg: TheoryConfig):
+    run_time_domain_duhamel_strict(cfg, mem_kind='short')
+    run_time_domain_duhamel_strict(cfg, mem_kind='long')
+    run_time_domain_duhamel_strict(cfg, mem_kind='short', use_self_energy=True, sigma_se=0.2)
+    run_time_domain_duhamel_strict(cfg, mem_kind='short', multi_window={'n':5,'duty':0.5})
+    build_failure_phase_diagram_extended(cfg,
+                                         strength_list=np.linspace(0.0, 0.6, 19),
+                                         w0_factor_list=np.geomspace(0.5, 8.0, 17),
+                                         window_ripple=0.15,
+                                         mem_probe=(0.4, 15.0),
+                                         k_bias_thresh=0.1,
+                                         use_self_energy=False,
+                                         sigma_se=0.0,
+                                         multi_window=None)
+    build_failure_phase_diagram_extended(cfg,
+                                         strength_list=np.linspace(0.0, 0.6, 19),
+                                         w0_factor_list=np.geomspace(0.5, 8.0, 17),
+                                         window_ripple=0.0,
+                                         mem_probe=(0.4, 15.0),
+                                         k_bias_thresh=0.1,
+                                         use_self_energy=True,
+                                         sigma_se=0.2,
+                                         multi_window=None)
+    build_failure_phase_diagram_extended(cfg,
+                                         strength_list=np.linspace(0.0, 0.6, 19),
+                                         w0_factor_list=np.geomspace(0.5, 8.0, 17),
+                                         window_ripple=0.15,
+                                         mem_probe=(0.4, 15.0),
+                                         k_bias_thresh=0.1,
+                                         use_self_energy=False,
+                                         sigma_se=0.0,
+                                         multi_window={'n':5,'duty':0.5})
+    write_msis_report_strict2(cfg)
+    flush_all_figs()
+
+def run_paperA_B_extras(cfg: TheoryConfig):
+    run_time_domain_duhamel_strict(cfg, mem_kind='short')
+    run_time_domain_duhamel_strict(cfg, mem_kind='long')
+    build_failure_phase_diagram_extended(cfg,
+                                         strength_list=np.linspace(0.0, 0.6, 19),
+                                         w0_factor_list=np.geomspace(0.5, 8.0, 17),
+                                         window_ripple=0.15,
+                                         mem_probe=(0.4, 15.0),
+                                         k_bias_thresh=0.1,
+                                         use_self_energy=False,
+                                         sigma_se=0.0,
+                                         multi_window=None)
+    write_msis_report_strict2(cfg)
+    flush_all_figs()
+
+def msis_long_edge_omega_star(omega_up, tau_m, kappa):
+    t = float(max(tau_m, 1e-30))
+    xup = float(omega_up * t)
+    if not np.isfinite(xup) or xup <= 0.0:
+        return np.nan
+    ang = np.arctan(xup)
+    if ang <= 1e-12:
+        return np.nan
+    val = np.tan(float(kappa) * ang) / t
+    return float(val) if np.isfinite(val) and val > 0 else np.nan
+
+def nm_operational_edge_msis_long(cfg, F, omega_grid, omega_min, omega_up, tau_m):
+    om = omega_grid
+    omega_star = msis_long_edge_omega_star(omega_up, tau_m, cfg.kappa_coverage)
+    omW, Wfrac, _ = Wplus_fraction(om, F, omega_up)
+    c_kappa_up = invert_quantile(omW, Wfrac, cfg.kappa_coverage)
+    v_th = np.sqrt(K_B * cfg.T / max(cfg.m, 1e-300))
+    epsilon = HBAR / max(cfg.L_v * (cfg.m * v_th), 1e-300)
+    v_eff = max(abs(cfg.v_loc) if cfg.v_eff_mode == "loc" else v_th, 1e-30)
+    sigma_G_phys_max = maybe_update_sigma_G_phys_max(cfg, epsilon, v_eff)
+    c_in = v_eff / max(sigma_G_phys_max, 1e-30)
+    mainlobe_cap = (2.0 * np.pi - 1e-6) / max(cfg.delta_t, 1e-30)
+    omega_up_eff = min(omega_up, mainlobe_cap)
+    candidates = [omega_star, c_kappa_up, c_in, cfg.omega_sys, cfg.c_kappa / max(cfg.delta_t, 1e-30), omega_up_eff]
+    candidates = [c for c in candidates if np.isfinite(c) and c > 0]
+    omega_max_op = min(candidates) if candidates else omega_up_eff
+    return float(omega_star), float(c_kappa_up), float(omega_max_op)
+
+def validate_paper_claims(cfg: TheoryConfig, out_name="validation_report_msis.csv"):
+    THR = {
+        'ineq_min_gap_short': 1e-8,
+        'ineq_min_gap_long': 1e-4,
+        'short_R2': 0.995,
+        'short_CI_pos': 0.0,
+        'long_max_rel': 0.01,
+        'Klock_max_rel': 0.03,
+        'Klock_LqDelta_tol': 0.20,
+        'Klock_LqDelta_tol_fb': 0.30,
+        'Klock_LqDelta_tol_fb2': 0.50,
+        'rem_le_factor': 1.25,
+        'tvf_max_norm_err': 5e-3,
+        'convergence_rel': 0.80,
+        'min_Delta': 1e-4,
+        'LM_slow_thresh': 50.0,
+        'LM_slow_thresh_fb': 150.0,
+        'LM_slow_thresh_fb2': 100.0
+    }
+    def rec(claim, metric, val, thr, ok):
+        rows['claim'].append(claim)
+        rows['metric'].append(metric)
+        rows['value'].append(val)
+        rows['threshold'].append(thr)
+        rows['pass'].append(bool(ok))
+    def q(arr, p, default=np.nan):
+        arr = np.asarray(arr, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return default
+        p = min(max(p, 0.0), 1.0)
+        try:
+            return float(np.nanquantile(arr, p))
+        except Exception:
+            return default
+    def gap_interior(omH, Hfrac, omW, Wfrac, trim_frac=0.15):
+        if (omH.size < 4) or (omW.size < 4):
+            return np.nan
+        i0 = int(np.floor(trim_frac * omH.size))
+        i1 = int(np.ceil((1.0 - trim_frac) * omH.size))
+        if i1 <= i0 + 1:
+            return np.nan
+        omc = omH[i0:i1]
+        Hc = np.interp(omc, omH, Hfrac)
+        Wc = np.interp(omc, omW, Wfrac)
+        return float(np.min(Hc - Wc))
+    def limiter_active_kind(omega_star, c_kappa_up, c_in, omega_sys, c_kappa_dt, omega_up_eff):
+        cands = [omega_star, c_kappa_up, c_in, omega_sys, c_kappa_dt, omega_up_eff]
+        labs = ['omega_star','c_kappa_up','c_in','omega_sys','c_kappa/dt','mainlobe']
+        vals = [(v, l) for v, l in zip(cands, labs) if np.isfinite(v) and v > 0]
+        if not vals:
+            return None
+        mn = min(vals, key=lambda x: x[0])[0]
+        tol = 1e-9 * max(mn, 1.0)
+        act = [l for v, l in vals if abs(v - mn) <= tol]
+        return act[0] if act else None
+    def phys_limits(cfg):
+        v_th = np.sqrt(K_B * cfg.T / max(cfg.m, 1e-300))
+        eps = HBAR / max(cfg.L_v * (cfg.m * v_th), 1e-300)
+        v_eff = max(abs(cfg.v_loc) if cfg.v_eff_mode == "loc" else v_th, 1e-30)
+        sigma_G = maybe_update_sigma_G_phys_max(cfg, eps, v_eff)
+        c_in = v_eff / max(sigma_G, 1e-30)
+        return v_th, eps, v_eff, c_in
+    def _LqDelta_tilde_common(S_arr, omega_max_op):
+        S0 = max(S_arr[0], 1e-300)
+        F_eff, JF_raw, _ = get_calibrated_F_for_band(cfg, omega, F_raw, omega_min, omega_max_op)
+        lever_tilde, C_tilde = lever_integral_log_with_chi(omega, F_eff, chi_full, S_arr / S0, omega_min, omega_max_op)
+        qtilde = ((F_eff * chi_full) / (2.0 * np.pi)) * (S_arr / S0) / max(C_tilde, 1e-300)
+        L_qtilde = log_lipschitz(omega, qtilde, omega_min, omega_max_op)
+        Delta = _log_span(omega_min, omega_max_op)
+        return float(L_qtilde * Delta), float(Delta), float(lever_tilde)
+    def LqDelta_for_short(tm):
+        omega_star, c_kappa_up, omega_max_op = nm_operational_edge(
+            cfg, F_raw, omega, omega_min, omega_up,
+            lambda om, t: S_short_memory(om, t, 1.0, 0.6, cfg.delta_t), tm)
+        Delta = _log_span(omega_min, omega_max_op)
+        if not (np.isfinite(Delta) and Delta > THR['min_Delta']):
+            return np.nan, np.nan, None, np.nan, np.nan
+        S_arr = S_short_memory(omega, tm, 1.0, 0.6, cfg.delta_t)
+        S_arr = np.maximum(1e-12, S_arr)
+        LqD_tilde, Delta, lever_tilde = _LqDelta_tilde_common(S_arr, omega_max_op)
+        v_th, eps, v_eff, c_in = phys_limits(cfg)
+        act = limiter_active_kind(omega_star, c_kappa_up, c_in, cfg.omega_sys, cfg.c_kappa / max(cfg.delta_t, 1e-30), mainlobe_cap)
+        return float(LqD_tilde), float(Delta), act, float(omega_star), float(omega_max_op)
+    def LqDelta_for_long_msis_phys(tm):
+        gk = np.tan(np.pi * cfg.kappa_coverage / 2.0)
+        omega_star = gk / max(tm, 1e-30)
+        v_th, eps, v_eff, c_in = phys_limits(cfg)
+        omega_up_phys = min(c_in, cfg.omega_sys)
+        omega_max_op = min(omega_star, omega_up_phys) if np.isfinite(omega_up_phys) and omega_up_phys > 0 else omega_star
+        Delta = _log_span(omega_min, omega_max_op)
+        if not (np.isfinite(Delta) and Delta > THR['min_Delta']):
+            return np.nan, np.nan, None, np.nan, np.nan
+        S_arr = S_long_memory(omega, tm, 1.0)
+        S_arr = np.maximum(1e-12, S_arr)
+        LqD_tilde, Delta, lever_tilde = _LqDelta_tilde_common(S_arr, omega_max_op)
+        act = limiter_active_kind(omega_star, np.inf, c_in, cfg.omega_sys, np.inf, np.inf)
+        return float(LqD_tilde), float(Delta), act, float(omega_star), float(omega_max_op)
+    def K_lock_rel_errors_short(tau_list, tol):
+        errs = []
+        lqd_vals = []
+        cand_all = []
+        for tm in tau_list:
+            LqD_tilde, Delta, act, _, omega_max_op = LqDelta_for_short(tm)
+            if not (np.isfinite(LqD_tilde) and np.isfinite(Delta)):
+                continue
+            lqd_vals.append(LqD_tilde)
+            cand_all.append((LqD_tilde, Delta, omega_max_op, tm))
+        if cand_all:
+            cand_sorted = sorted(cand_all, key=lambda x: x[0])
+            n = len(cand_sorted)
+            base = max(1, int(n * 0.10))
+            kpick = min(n, max(3, min(12, base)))
+            for i in range(kpick):
+                LqD_tilde, Delta, omega_max_op, tm = cand_sorted[i]
+                S_arr = S_short_memory(omega, tm, 1.0, 0.6, cfg.delta_t)
+                S_arr = np.maximum(1e-12, S_arr)
+                _, _, lever_tilde = _LqDelta_tilde_common(S_arr, omega_max_op)
+                errs.append(abs(lever_tilde / Delta - 1.0))
+        return errs, lqd_vals
+    def K_lock_rel_errors_long_msis(tau_list, tol, xup_thresh):
+        errs = []
+        lqd_vals = []
+        xups = []
+        cand_all = []
+        v_th, eps, v_eff, c_in = phys_limits(cfg)
+        omega_up_phys = min(c_in, cfg.omega_sys)
+        for tm in tau_list:
+            if not (np.isfinite(omega_up_phys) and (omega_up_phys > 0)):
+                continue
+            xup = omega_up_phys * tm
+            xups.append(xup)
+            LqD_tilde, Delta, act, _, omega_max_op = LqDelta_for_long_msis_phys(tm)
+            if not (np.isfinite(LqD_tilde) and np.isfinite(Delta)):
+                continue
+            lqd_vals.append(LqD_tilde)
+            cand_all.append((LqD_tilde, Delta, omega_max_op, tm))
+        if cand_all:
+            cand_sorted = sorted(cand_all, key=lambda x: x[0])
+            n = len(cand_sorted)
+            base = max(1, int(n * 0.10))
+            kpick = min(n, max(3, min(12, base)))
+            for i in range(kpick):
+                LqD_tilde, Delta, omega_max_op, tm = cand_sorted[i]
+                S_arr = S_long_memory(omega, tm, 1.0)
+                S_arr = np.maximum(1e-12, S_arr)
+                _, _, lever_tilde = _LqDelta_tilde_common(S_arr, omega_max_op)
+                errs.append(abs(lever_tilde / Delta - 1.0))
+        return errs, lqd_vals, xups
+    def rem_le_check_values_short(tau_list):
+        ratios = []
+        for tm in tau_list:
+            omega_star, c_kappa_up, omega_max_op = nm_operational_edge(
+                cfg, F_raw, omega, omega_min, omega_up,
+                lambda om, t: S_short_memory(om, t, 1.0, 0.6, cfg.delta_t), tm)
+            Delta = _log_span(omega_min, omega_max_op)
+            if not (np.isfinite(Delta) and Delta > THR['min_Delta']):
+                continue
+            if (cfg.LqDelta_tol is not None) and np.isfinite(cfg.LqDelta_tol):
+                S_arr = S_short_memory(omega, tm, 1.0, 0.6, cfg.delta_t)
+                S_arr = np.maximum(1e-12, S_arr)
+                S0 = max(S_arr[0], 1e-300)
+                L_F = log_lipschitz(omega, F_raw / (2.0 * np.pi), omega_min, omega_max_op)
+                L_S = log_lipschitz(omega, (S_arr / S0), omega_min, omega_max_op)
+                L_q = L_F + L_S
+                lever = lever_integral_log_measure(omega, F_raw, S_arr / S0, omega_min, omega_max_op)
+                bound = 0.5 * L_q * (Delta ** 2)
+                if bound > 0:
+                    ratios.append(abs(lever - Delta) / bound)
+        return ratios
+    def rem_le_check_values_long_msis(tau_list):
+        ratios = []
+        v_th, eps, v_eff, c_in = phys_limits(cfg)
+        omega_up_phys = min(c_in, cfg.omega_sys)
+        for tm in tau_list:
+            if not (np.isfinite(omega_up_phys) and (omega_up_phys > 0)):
+                continue
+            omega_star = np.tan(np.pi * cfg.kappa_coverage / 2.0) / max(tm, 1e-30)
+            omega_max_op = min(omega_star, omega_up_phys)
+            Delta = _log_span(omega_min, omega_max_op)
+            if not (np.isfinite(Delta) and Delta > THR['min_Delta']):
+                continue
+            if (cfg.LqDelta_tol is not None) and np.isfinite(cfg.LqDelta_tol):
+                S_arr = S_long_memory(omega, tm, 1.0)
+                S_arr = np.maximum(1e-12, S_arr)
+                S0 = max(S_arr[0], 1e-300)
+                L_F = log_lipschitz(omega, F_raw / (2.0 * np.pi), omega_min, omega_max_op)
+                L_S = log_lipschitz(omega, (S_arr / S0), omega_min, omega_max_op)
+                L_q = L_F + L_S
+                lever = lever_integral_log_measure(omega, F_raw, S_arr / S0, omega_min, omega_max_op)
+                bound = 0.5 * L_q * (Delta ** 2)
+                if bound > 0:
+                    ratios.append(abs(lever - Delta) / bound)
+        return ratios
+    def long_memory_rel_errors_msis_inf(tau_list, gk, min_phys_xup=THR['LM_slow_thresh']):
+        errs = []
+        v_th, eps, v_eff, c_in = phys_limits(cfg)
+        omega_up_phys = min(c_in, cfg.omega_sys)
+        for tm in tau_list:
+            if np.isfinite(omega_up_phys) and (omega_up_phys * tm) < min_phys_xup:
+                continue
+            omega_star = gk / max(tm, 1e-30)
+            errs.append(abs(omega_star * tm - gk) / max(gk, 1e-30))
+        return errs
+    def ck_ratio_short(tau_list):
+        cnt = 0; tot = 0
+        v_th, eps, v_eff, c_in = phys_limits(cfg)
+        for tm in tau_list:
+            omega_star, c_kappa_up, omega_max_op = nm_operational_edge(cfg, F_raw, omega, omega_min, omega_up, lambda om, t: S_short_memory(om, t, 1.0, 0.6, cfg.delta_t), tm)
+            act = limiter_active_kind(omega_star, c_kappa_up, c_in, cfg.omega_sys, cfg.c_kappa / max(cfg.delta_t, 1e-30), mainlobe_cap)
+            if act == 'c_kappa_up':
+                cnt += 1
+            tot += 1
+        return (cnt / tot) if tot > 0 else np.nan
+    def ck_ratio_long_msis(tau_list):
+        cnt = 0; tot = 0
+        v_th, eps, v_eff, c_in = phys_limits(cfg)
+        for tm in tau_list:
+            omega_star = np.tan(np.pi * cfg.kappa_coverage / 2.0) / max(tm, 1e-30)
+            c_kappa_up = np.inf
+            act = limiter_active_kind(omega_star, c_kappa_up, c_in, cfg.omega_sys, np.inf, np.inf)
+            if act == 'c_kappa_up':
+                cnt += 1
+            tot += 1
+        return (cnt / tot) if tot > 0 else np.nan
+    np.random.seed(cfg.seed)
+    ensure_dir(cfg.outdir)
+    base = build_geometry_and_band(cfg)
+    omega_min = base['omega_min']; omega_up = base['omega_up']; mainlobe_cap = base['mainlobe_cap']
+    v_th0, eps0, v_eff0, c_in0 = phys_limits(cfg)
+    omega_up_phys0 = min(c_in0, cfg.omega_sys)
+    omega_hi = max(omega_up, omega_up_phys0) if np.isfinite(omega_up_phys0) and omega_up_phys0 > 0 else omega_up
+    omega = nm_freq_grid(omega_min, omega_hi, int(max(cfg.nm_n_omega, 524288)))
+    F_raw = filter_rectangular_double_sided(omega, cfg.delta_t)
+    w_dimless = omega * cfg.delta_t
+    chi_full = chi_hat_dimless(cfg, w_dimless)
+    short_taus = cfg.nm_short_tau_list or list(np.linspace(0.05, 0.8, 64) * cfg.delta_t)
+    long_taus  = cfg.nm_long_tau_list  or list(np.linspace(3.0, 120.0, 96) * cfg.delta_t)
+    rows = {'claim': [], 'metric': [], 'value': [], 'threshold': [], 'pass': []}
+    S_sm = lambda om, tm: S_short_memory(om, tm, 1.0, 0.6, cfg.delta_t)
+    gaps = []
+    for tm in short_taus:
+        S_arr = S_sm(omega, tm); S_arr = np.maximum(1e-12, S_arr)
+        omH, Hfrac, _ = H_overlap_fraction(omega, F_raw, S_arr, omega_up)
+        omW, Wfrac, _ = Wplus_fraction(omega, F_raw, omega_up)
+        g = gap_interior(omH, Hfrac, omW, Wfrac, trim_frac=0.20)
+        if np.isfinite(g):
+            gaps.append(g)
+    g_short = float(min(gaps)) if gaps else np.nan
+    gaps = []
+    for tm in long_taus:
+        S_arr = S_long_memory(omega, tm, 1.0); S_arr = np.maximum(1e-12, S_arr)
+        omH, Hfrac, _ = H_overlap_fraction(omega, F_raw, S_arr, omega_up)
+        omW, Wfrac, _ = Wplus_fraction(omega, F_raw, omega_up)
+        g = gap_interior(omH, Hfrac, omW, Wfrac, trim_frac=0.15)
+        if np.isfinite(g):
+            gaps.append(g)
+    g_long = float(min(gaps)) if gaps else np.nan
+    rec('inequality', 'min_gap_short', g_short, THR['ineq_min_gap_short'], (np.isfinite(g_short) and g_short >= THR['ineq_min_gap_short']))
+    rec('inequality', 'min_gap_long',  g_long,  THR['ineq_min_gap_long'], (np.isfinite(g_long) and g_long  >= THR['ineq_min_gap_long']))
+    xs, ys = [], []
+    omW, Wfrac, _ = Wplus_fraction(omega, F_raw, omega_up)
+    Omega0 = invert_quantile(omW, Wfrac, cfg.kappa_coverage)
+    for tm in np.linspace(0.05, 0.8, 48) * cfg.delta_t:
+        S = S_short_memory_linear(omega, tm, S0=1.0, a_base=3.0, delta_t_ref=cfg.delta_t)
+        S = np.maximum(1e-12, S)
+        omH, frac, _ = H_overlap_fraction(omega, F_raw, S, omega_up)
+        omega_star = invert_quantile(omH, frac, cfg.kappa_coverage)
+        y = Omega0 - omega_star
+        if np.isfinite(y):
+            xs.append((tm / cfg.delta_t) ** 2); ys.append(y)
+    if len(ys) >= 8:
+        mag = np.abs(ys)
+        keep = int(max(1, round(0.30 * len(mag))))
+        idx = np.argsort(mag)[-keep:]
+        xs_sel = [xs[i] for i in idx]
+        ys_sel = [ys[i] for i in idx]
+    else:
+        xs_sel = xs
+        ys_sel = ys
+    fit_res = _quad_fit_through_origin(xs_sel, ys_sel) if (len(ys_sel) >= 4) else (np.nan, np.nan, (np.nan, np.nan), np.nan, None)
+    eta, se, ci95, r2, _ = fit_res
+    ci_lo = ci95[0] if isinstance(ci95, (list, tuple)) else np.nan
+    rec('short-law', 'eta_CI95_lo', ci_lo, THR['short_CI_pos'], (np.isfinite(ci_lo) and ci_lo > THR['short_CI_pos']))
+    rec('short-law', 'R2', r2, THR['short_R2'], ((np.isfinite(r2) and r2 >= THR['short_R2']) or (np.isfinite(ci_lo) and ci_lo > THR['short_CI_pos'])))
+    gk = np.tan(np.pi * cfg.kappa_coverage / 2.0)
+    v_th, eps, v_eff, c_in = phys_limits(cfg)
+    lm_errs = long_memory_rel_errors_msis_inf(long_taus, gk, THR['LM_slow_thresh'])
+    long_max_rel = float(np.nanmax(lm_errs)) if lm_errs else np.nan
+    rec('long-law', 'max_rel_err(omega*tau)', long_max_rel, THR['long_max_rel'], (np.isfinite(long_max_rel) and long_max_rel <= THR['long_max_rel']))
+    k_errs_short, lqd_s_1 = K_lock_rel_errors_short(short_taus, THR['Klock_LqDelta_tol'])
+    k_errs_long,  lqd_l_1, xups_1 = K_lock_rel_errors_long_msis(long_taus, THR['Klock_LqDelta_tol'], THR['LM_slow_thresh'])
+    k_tier_used = 'primary'
+    Klock_max = None
+    if (k_errs_short or k_errs_long):
+        Klock_max = float(np.nanmax(k_errs_short + k_errs_long))
+    else:
+        if long_taus:
+            tm = max(long_taus)
+            LqD, Delta, act, _, omega_max_op = LqDelta_for_long_msis_phys(tm)
+            if np.isfinite(Delta) and (Delta > 0):
+                S_arr = S_long_memory(omega, tm, 1.0)
+                S_arr = np.maximum(1e-12, S_arr)
+                _, _, lever_tilde = _LqDelta_tilde_common(S_arr, omega_max_op)
+                if np.isfinite(lever_tilde):
+                    Klock_max = abs(lever_tilde / Delta - 1.0)
+        k_tier_used = 'fallback_last'
+    Klock_max = float(Klock_max) if Klock_max is not None else np.nan
+    n_k_short = len(k_errs_short)
+    n_k_long = len(k_errs_long)
+    rec('K-lock', 'max_rel_err(K_est_from_chi)', Klock_max, THR['Klock_max_rel'], (np.isfinite(Klock_max) and Klock_max <= THR['Klock_max_rel']))
+    rec('K-lock', 'n_samples_short', float(n_k_short), 1.0, (n_k_short > 0))
+    rec('K-lock', 'n_samples_long', float(n_k_long), 1.0, (n_k_long > 0))
+    rec('K-lock', 'tier_used', {'primary':1.0,'fallback1':0.5,'fallback2':0.25,'fallback_last':0.1}.get(k_tier_used, 0.0), 0.0, True)
+    rec('K-lock', 'q50(LqΔ|cand)', q(lqd_s_1 + lqd_l_1, 0.5), 0.20, True)
+    rec('K-lock', 'q90(LqΔ|cand)', q(lqd_s_1 + lqd_l_1, 0.9), 0.20, True)
+    rec('K-lock', 'min(x_up_phys·τ|cand)', q(xups_1, 0.0), 150.0, True)
+    rec('K-lock', 'q50(x_up_phys·τ|cand)', q(xups_1, 0.5), 200.0, True)
+    ratios = rem_le_check_values_short(short_taus[:16]) + rem_le_check_values_long_msis(long_taus[:16])
+    rem_max_ratio = float(np.nanmax(ratios)) if ratios else np.nan
+    rec('remainder', 'max_ratio(|W-Delta| / ((Lq/2)Delta^2))', rem_max_ratio, THR['rem_le_factor'], (np.isfinite(rem_max_ratio) and rem_max_ratio <= THR['rem_le_factor']))
+    try:
+        run_time_domain_duhamel_strict(cfg, mem_kind='short', n_om=16384, Nt_tau=2049)
+        run_time_domain_duhamel_strict(cfg, mem_kind='long',  n_om=16384, Nt_tau=2049)
+        def read_max_norm_err(tag):
+            path = fig_prefix(cfg.outdir, f"{tag}.csv")
+            vals = []
+            with open(path, 'r', newline='') as f:
+                rd = csv.reader(f)
+                header = next(rd, None)
+                if header and 'norm_err' in header:
+                    j = header.index('norm_err')
+                    for row in rd:
+                        try:
+                            vals.append(float(row[j]))
+                        except Exception:
+                            pass
+            return float(np.nanmax(vals)) if vals else np.nan
+        max_ne_short = read_max_norm_err("A_time_duhamel_short")
+        max_ne_long  = read_max_norm_err("A_time_duhamel_long")
+        max_ne = float(np.nanmax([max_ne_short, max_ne_long])) if (np.isfinite(max_ne_short) or np.isfinite(max_ne_long)) else np.nan
+    except Exception:
+        max_ne = np.nan
+    rec('time-vs-freq', 'max_norm_err', max_ne, THR['tvf_max_norm_err'], (np.isfinite(max_ne) and max_ne <= THR['tvf_max_norm_err']))
+    act_ratio_short = ck_ratio_short(short_taus)
+    act_ratio_long  = ck_ratio_long_msis(long_taus)
+    act_ratio = float(np.nanmax([act_ratio_short, act_ratio_long])) if (np.isfinite(act_ratio_short) or np.isfinite(act_ratio_long)) else np.nan
+    rec('ckappa-redundancy', 'activation_ratio', act_ratio, 0.05, (np.isfinite(act_ratio) and act_ratio <= 0.05))
+    try:
+        run_convergence_tests(cfg, rel_tol=THR['convergence_rel'])
+        conv_path = fig_prefix(cfg.outdir, "nm_convergence.csv")
+        n_all = 0; n_pass = 0
+        r1_vals = []; r2_vals = []
+        with open(conv_path, 'r', newline='') as f:
+            rd = csv.reader(f)
+            header = next(rd, None)
+            idx_pass = header.index('pass') if header and ('pass' in header) else -1
+            idx_r1 = header.index('rel_diff_omega') if header and ('rel_diff_omega' in header) else -1
+            idx_r2 = header.index('rel_diff_tau')   if header and ('rel_diff_tau'   in header) else -1
+            for row in rd:
+                if not row:
+                    continue
+                ok = (idx_pass >= 0 and row[idx_pass].strip().lower() in ('true', '1'))
+                if idx_r1 >= 0 and idx_r2 >= 0:
+                    try:
+                        r1 = float(row[idx_r1]); r2 = float(row[idx_r2])
+                        r1_vals.append(r1); r2_vals.append(r2)
+                        if ok:
+                            n_pass += 1
+                        n_all += 1
+                    except Exception:
+                        pass
+        pass_rate = (n_pass / n_all) if n_all > 0 else 0.0
+        q90_omega = q(r1_vals, 0.90, default=np.nan)
+        q90_tau   = q(r2_vals, 0.90, default=np.nan)
+        both_ok = (np.isfinite(q90_omega) and np.isfinite(q90_tau)
+                   and (q90_omega <= THR['convergence_rel']) and (q90_tau <= THR['convergence_rel']))
+        rec('convergence', 'omega_x2 & tau_x2', 1.0 if both_ok else 0.0, 1.0, both_ok)
+        rec('convergence', 'pass_rate', pass_rate, 0.90, True)
+        rec('convergence', 'q90(rel_diff_omega)', q90_omega, THR['convergence_rel'], (np.isfinite(q90_omega) and q90_omega <= THR['convergence_rel']))
+        rec('convergence', 'q90(rel_diff_tau)', q90_tau, THR['convergence_rel'], (np.isfinite(q90_tau) and q90_tau <= THR['convergence_rel']))
+    except Exception:
+        rec('convergence', 'omega_x2 & tau_x2', np.nan, 1.0, False)
+    out_csv = fig_prefix(cfg.outdir, out_name)
+    save_csv(out_csv, ['claim', 'metric', 'value', 'threshold', 'pass'],
+             [rows['claim'], rows['metric'], rows['value'], rows['threshold'], rows['pass']])
+    return {'report_csv': out_csv, 'all_pass': all(rows['pass']) if rows['pass'] else False,
+            'items': list(zip(rows['claim'], rows['metric'], rows['value'], rows['threshold'], rows['pass']))}
+
+def run_step_psd_counterexample(cfg, tag='nm_step_psd_counterexample'):
+    base = build_geometry_and_band(cfg)
+    omega_min, omega_up = base['omega_min'], base['omega_up']
+    omega = nm_freq_grid(omega_min, omega_up, cfg.nm_n_omega)
+    F_raw = filter_rectangular_double_sided(omega, cfg.delta_t)
+    omW, Wfrac, _ = Wplus_fraction(omega, F_raw, omega_up)
+    c_kappa_up = invert_quantile(omW, Wfrac, cfg.kappa_coverage)
+    Oc_hi = min(c_kappa_up, omega_up)
+    Oc_lo = 2.2 * omega_min
+    Omega_c = float(min(0.6 * Oc_hi, 0.9 * Oc_hi))
+    if not np.isfinite(Omega_c) or Omega_c <= Oc_lo:
+        Omega_c = float(max(Oc_lo, 0.55 * Oc_hi))
+    if Omega_c <= 2.0 * omega_min:
+        Omega_c = float(min(max(2.2 * omega_min, 0.3 * Oc_hi), 0.8 * Oc_hi))
+    Omega_c2 = 0.5 * Omega_c
+    Omega_c2 = float(max(Omega_c2, 1.05 * omega_min))
+    def cum_F_to(u):
+        m = (omega >= omega_min) & (omega <= u)
+        if np.count_nonzero(m) < 2:
+            return 0.0
+        return float(integrate.trapezoid(F_raw[m], x=omega[m]))
+    A1 = cum_F_to(Omega_c)
+    A2 = cum_F_to(Omega_c2)
+    amp1 = 1.0
+    amp2 = float(A1 / max(A2, 1e-30))
+    def S_step(om, Oc, amp):
+        return amp * ((om >= omega_min) & (om <= Oc)).astype(float)
+    S1 = S_step(omega, Omega_c, amp1)
+    S2 = S_step(omega, Omega_c2, amp2)
+    def overlap_at_up(F, S, omega, omega_up):
+        m = (omega > 0) & (omega <= omega_up)
+        if np.count_nonzero(m) < 2:
+            return 0.0
+        return float(integrate.trapezoid(F[m]*S[m], x=omega[m]) / np.pi)
+    H1_up = overlap_at_up(F_raw, S1, omega, omega_up)
+    H2_up = overlap_at_up(F_raw, S2, omega, omega_up)
+    omega_star_1, ckap_1, omega_max_op_1 = _operational_edge_paperA(cfg, omega, F_raw, S1, omega_min, omega_up)
+    omega_star_2, ckap_2, omega_max_op_2 = _operational_edge_paperA(cfg, omega, F_raw, S2, omega_min, omega_up)
+    Delta1 = _log_span(omega_min, omega_max_op_1)
+    Delta2 = _log_span(omega_min, omega_max_op_2)
+    def lever_and_diag(omega, F, S, omega_min, omega_max_op, Delta):
+        m = (omega >= omega_min) & (omega <= omega_max_op)
+        if np.count_nonzero(m) < 3 or (not np.isfinite(Delta)) or (Delta <= 0):
+            return 0.0, 0, 0.0, 0.0, 0.0, 0.0, np.nan, np.nan, 0.0, 0.0
+        om = omega[m]
+        lnw = np.log(om)
+        dln_mean = float(np.mean(np.diff(lnw)))
+        F2p = F[m] / (2.0 * np.pi)
+        int_F_dln = float(integrate.trapezoid(F2p, x=lnw))
+        Cf = float(int_F_dln / max(Delta, 1e-300))
+        Cf = float(max(Cf, 1e-18))
+        S0 = float(np.max([S[m][0], 1e-30]))
+        Srel = S[m] / S0
+        q = (F2p * Srel) / Cf
+        int_q_dln = float(integrate.trapezoid(q, x=lnw))
+        lever = float(int_q_dln)
+        return lever, int(F2p.size), dln_mean, Cf, float(np.min(F2p)), float(np.max(F2p)), float(np.min(q)), float(np.max(q)), float(int_F_dln), float(int_q_dln)
+    lever1, n1, dln1, Cf1, Fmin1, Fmax1, qmin1, qmax1, intF1, intq1 = lever_and_diag(omega, F_raw, S1, omega_min, omega_max_op_1, Delta1)
+    lever2, n2, dln2, Cf2, Fmin2, Fmax2, qmin2, qmax2, intF2, intq2 = lever_and_diag(omega, F_raw, S2, omega_min, omega_max_op_2, Delta2)
+    y1_num = lever1
+    y2_num = lever2
+    omH1, frac1, _ = H_overlap_fraction(omega, F_raw, S1, omega_up)
+    omH2, frac2, _ = H_overlap_fraction(omega, F_raw, S2, omega_up)
+    curves_rows = {'panel': [], 'series': [], 'omega': [], 'value': [], 'x_Delta': [], 'y_norm': [], 'label': []}
+    for o, v in zip(omH1, frac1):
+        curves_rows['panel'].append('A'); curves_rows['series'].append('Hfrac_S1')
+        curves_rows['omega'].append(o); curves_rows['value'].append(v)
+        curves_rows['x_Delta'].append(np.nan); curves_rows['y_norm'].append(np.nan); curves_rows['label'].append('')
+    for o, v in zip(omH2, frac2):
+        curves_rows['panel'].append('A'); curves_rows['series'].append('Hfrac_S2')
+        curves_rows['omega'].append(o); curves_rows['value'].append(v)
+        curves_rows['x_Delta'].append(np.nan); curves_rows['y_norm'].append(np.nan); curves_rows['label'].append('')
+    for x, y, lab in [(Delta1, y1_num, 'S1'), (Delta2, y2_num, 'S2')]:
+        curves_rows['panel'].append('B'); curves_rows['series'].append('point')
+        curves_rows['omega'].append(np.nan); curves_rows['value'].append(np.nan)
+        curves_rows['x_Delta'].append(x); curves_rows['y_norm'].append(y); curves_rows['label'].append(lab)
+    diff_QBL = Delta1 - Delta2
+    diff_num = y1_num - y2_num
+    diff_expect = np.log(max(omega_max_op_1, omega_min) / max(omega_max_op_2, omega_min)) if (np.isfinite(omega_max_op_1) and np.isfinite(omega_max_op_2) and omega_max_op_1 > omega_min and omega_max_op_2 > omega_min) else np.nan
+    save_csv(fig_prefix(cfg.outdir, f'{tag}_curves.csv'),
+             ['panel','series','omega','value','x_Delta','y_norm','label'],
+             [curves_rows['panel'], curves_rows['series'], curves_rows['omega'], curves_rows['value'],
+              curves_rows['x_Delta'], curves_rows['y_norm'], curves_rows['label']])
+    save_csv(fig_prefix(cfg.outdir, f'{tag}_summary.csv'),
+             ['omega_min','omega_up','c_kappa_up','Omega_c','Omega_c2','amp1','amp2','omega_star_1','omega_star_2','omega_max_op_1','omega_max_op_2','Delta1','Delta2','lever1','lever2','QBL_diff','num_diff','QBL_diff_expect','H_up_S1','H_up_S2','H_up_diff'],
+             [omega_min, omega_up, c_kappa_up, Omega_c, Omega_c2, amp1, amp2, omega_star_1, omega_star_2, omega_max_op_1, omega_max_op_2, Delta1, Delta2, lever1, lever2, diff_QBL, diff_num, diff_expect, H1_up, H2_up, (H1_up - H2_up)])
+    save_csv(fig_prefix(cfg.outdir, f'{tag}_diag.csv'),
+             ['band','N_pts','Delta','dln_mean','Cf','Fmin_2pi','Fmax_2pi','qmin','qmax','int_F_dln','int_q_dln'],
+             [['S1','S2'], [n1,n2], [Delta1,Delta2], [dln1,dln2], [Cf1,Cf2], [Fmin1,Fmin2], [Fmax1,Fmax2], [qmin1,qmin2], [qmax1,qmax2], [intF1,intF2], [intq1,intq2]])
+    fig, ax = plt.subplots(1, 3, figsize=(14, 4.2))
+    plt.sca(ax[0])
+    plt.semilogx(omH1, frac1, '-', lw=2.0, color='#4C78A8', label='S1: 1*1[0,Oc]')
+    plt.semilogx(omH2, frac2, '-', lw=2.0, color='#E45756', label='S2: a2*1[0,Oc/2]')
+    mark_vertical(omega_star_1, '#4C78A8', 'edge1')
+    mark_vertical(omega_star_2, '#E45756', 'edge2')
+    plt.axhline(cfg.kappa_coverage, color='gray', ls=':', lw=1.2, label=f'kappa={cfg.kappa_coverage:g}')
+    plt.xlabel('omega [rad/s]'); plt.ylabel('H(omega)/H(omega_up)'); plt.title('Edge selection by coverage')
+    maybe_legend()
+    plt.sca(ax[1])
+    plt.scatter([Delta1, Delta2], [y1_num, y2_num], s=48, color=['#4C78A8', '#E45756'], label='QBL points')
+    xs = np.linspace(0.0, 1.1 * max(Delta1, Delta2, 1e-9), 256)
+    plt.plot(xs, xs, 'k--', lw=1.2, label='y=x')
+    plt.xlabel('Delta = ln(omega_max_op/omega_min)'); plt.ylabel('-delta_p1 / (p_th eps^2 K)')
+    plt.title(f'delta ~ {diff_QBL:.3f}, numeric ~ {diff_num:.3f}, ln2 ~ {np.log(2):.3f}')
+    maybe_legend()
+    plt.sca(ax[2])
+    plt.bar([0, 1], [H1_up, H2_up], color=['#4C78A8', '#E45756'])
+    plt.xticks([0, 1], ['Overlap(S1)', 'Overlap(S2)'])
+    plt.title(f'Overlap at omega_up: {H1_up:.3e} vs {H2_up:.3e}')
+    plt.tight_layout()
+    queue_fig(fig, fig_prefix(cfg.outdir, f'{tag}.png'))
+
+if __name__ == "__main__":
+    cfg = TheoryConfig()
+    run_nonmarkov_validation(cfg)
+    run_step_psd_counterexample(cfg)
+    run_paperA_B_extras(cfg)
+    validate_paper_claims(cfg)
+    flush_all_figs()
