@@ -1283,7 +1283,7 @@ def run_nonmarkov_validation(cfg: TheoryConfig):
     plot_nm_spectrum_flatness(cfg, 'Flatness (long memory): q(omega)', 'nm_flatness_q_long', omega, F_raw, cfg.nm_long_tau_list[:6], S_long_memory, omega_min, omega_up)
     plot_nm_J_factors(cfg, 'J factors (short, log-measure)', 'nm_J_factors_short', omega, omega_min, omega_up, cfg.nm_short_tau_list[:6], 'short')
     plot_nm_J_factors(cfg, 'J factors (long, log-measure)', 'nm_J_factors_long', omega, omega_min, omega_up, cfg.nm_long_tau_list[:6], 'long')
-    small_short_taus = list(np.linspace(0.0, 0.3, 64) * cfg.delta_t)
+    small_short_taus = list(np.array([0.01, 0.015, 0.02, 0.025, 0.03]) * cfg.delta_t)
     plot_nm_short_scaling(cfg, 'nm_short_scaling', omega, F_raw, omega_min, omega_up, small_short_taus, c_base_lin=0.6)
     plot_nm_long_scaling(cfg, 'nm_long_scaling', omega, F_raw, omega_min, omega_up, cfg.nm_long_tau_list)
     plot_nm_remainders(cfg, 'Remainders (short memory)', 'nm_remainders_short', omega, F_raw, omega_min, omega_up, cfg.nm_short_tau_list[:6], S_short_memory, K_val, p_th, epsilon)
@@ -2238,6 +2238,97 @@ def run_step_psd_counterexample(cfg, tag='nm_step_psd_counterexample'):
     plt.tight_layout()
     queue_fig(fig, fig_prefix(cfg.outdir, f'{tag}.png'))
 
+def _build_edge_grid(omega_min, omega_up, n_log=16384, n_lin=8192):
+    omega_min = float(omega_min)
+    omega_up = float(omega_up)
+    n_log = int(n_log)
+    n_lin = int(n_lin)
+    a = max(omega_min, omega_up * 1e-12)
+    left = np.linspace(0.0, max(omega_min, omega_up * 1e-9), max(2, n_lin))
+    right = np.exp(np.linspace(np.log(a), np.log(omega_up), max(4, n_log)))
+    return np.unique(np.concatenate([left, right], axis=0))
+
+def _get_edge_grid(omega_min, omega_up, cfg):
+    nlog = getattr(cfg, 'nm_n_omega', None)
+    if not isinstance(nlog, (int, np.integer)) or nlog <= 0:
+        nlog = 16384
+    return _build_edge_grid(omega_min, omega_up, nlog, 8192)
+
+def nm_operational_edge_hr(cfg, S_func, tau_m, omega_min, omega_up):
+    omega_edge = _get_edge_grid(omega_min, omega_up, cfg)
+    F_edge = filter_rectangular_double_sided(omega_edge, cfg.delta_t)
+    S_edge = S_func(omega_edge, tau_m)
+    omH, fracH, _ = H_overlap_fraction(omega_edge, F_edge, S_edge, omega_up)
+    omega_star = invert_quantile(omH, fracH, cfg.kappa_coverage)
+    omW, fracW, _ = Wplus_fraction(omega_edge, F_edge, omega_up)
+    c_kappa_up = invert_quantile(omW, fracW, cfg.kappa_coverage)
+    omega_max_op = min(omega_star, c_kappa_up, omega_up)
+    return float(omega_star), float(c_kappa_up), float(omega_max_op)
+
+def run_scaling_validation_fast(cfg):
+    base = build_geometry_and_band(cfg)
+    omega_min, omega_up = base['omega_min'], base['omega_up']
+    omega_edge = _get_edge_grid(omega_min, omega_up, cfg)
+    F_edge = filter_rectangular_double_sided(omega_edge, cfg.delta_t)
+    omW, Wfrac, _ = Wplus_fraction(omega_edge, F_edge, omega_up)
+    Omega0 = invert_quantile(omW, Wfrac, cfg.kappa_coverage)
+    short_taus = cfg.nm_short_tau_list or list(np.linspace(0.02, 0.3, 12) * cfg.delta_t)
+    xs, ys, tm_list, omega_star_list = [], [], [], []
+    for tm in short_taus:
+        S_sm = lambda om, tt: S_short_memory(om, tt, S0=1.0, c_base=0.6, delta_t_ref=cfg.delta_t)
+        omega_star, _, _ = nm_operational_edge_hr(cfg, S_sm, tm, omega_min, omega_up)
+        x = (tm / cfg.delta_t) ** 2
+        y = Omega0 - omega_star
+        xs.append(x); ys.append(y); tm_list.append(tm); omega_star_list.append(omega_star)
+    xarr = np.asarray(xs, dtype=float)
+    yarr = np.asarray(ys, dtype=float)
+    denom = max(np.sum(xarr * xarr), 1e-30)
+    eta_fit = float(np.sum(xarr * yarr) / denom)
+    fig2b = plt.figure(figsize=(6.4, 4.4))
+    plt.plot(xarr, yarr, 'o', ms=4, label='data')
+    xr = np.linspace(0.0, (xarr.max() * 1.05) if xarr.size else 1.0, 256)
+    plt.plot(xr, eta_fit * xr, 'k--', lw=1.4, label=f'fit  η={eta_fit:.3e} (rad/s)')
+    plt.xlabel(r'$(t_{\mathrm{m}}/\Delta t)^2$')
+    plt.ylabel(r'$\Omega_{0}-\Omega_{\ast}$')
+    plt.title('Short-memory quadratic law (high-res edge)')
+    maybe_legend()
+    plt.tight_layout()
+    queue_fig(fig2b, fig_prefix(cfg.outdir, "fig2b_hr.png"))
+    save_csv(
+        fig_prefix(cfg.outdir, "fig2b_hr.csv"),
+        ['t_m_s', 'x=(t_m/dt)^2', 'Omega0', 'Omega_star', 'gap=Omega0-Omega_star', 'eta_fit(rad/s)'],
+        [tm_list, xs, [Omega0] * len(xs), omega_star_list, ys, eta_fit]
+    )
+    long_taus = cfg.nm_long_tau_list or list(np.linspace(3.0, 60.0, 48) * cfg.delta_t)
+    g_inf = float(np.tan(np.pi * cfg.kappa_coverage / 2.0))
+    x_up_list, prod_list, tmL_list = [], [], []
+    for tm in long_taus:
+        S_lm = lambda om, tt: S_long_memory(om, tt, S0=1.0)
+        omega_star, _, _ = nm_operational_edge_hr(cfg, S_lm, tm, omega_min, omega_up)
+        x_up = omega_up * tm
+        prod = omega_star * tm
+        x_up_list.append(x_up); prod_list.append(prod); tmL_list.append(tm)
+    x_up_arr = np.asarray(x_up_list, dtype=float)
+    prod_arr = np.asarray(prod_list, dtype=float)
+    xgrid = np.linspace(max(1e-9, float(x_up_arr.min() if x_up_arr.size else 1.0)),
+                        float(x_up_arr.max() * 1.05 if x_up_arr.size else 10.0), 300)
+    g_eff = np.tan(cfg.kappa_coverage * np.arctan(xgrid))
+    fig3b = plt.figure(figsize=(6.4, 4.4))
+    plt.plot(x_up_arr, prod_arr, 'o', ms=4, label=r'data: $\Omega_{\ast} t_{\mathrm{m}}$')
+    plt.axhline(g_inf, color='k', ls='--', lw=1.2, label=rf'$g(\kappa)={g_inf:.3f}$')
+    plt.plot(xgrid, g_eff, 'r:', lw=1.2, label=r'$g_{\mathrm{eff}}(x_{\mathrm{up}})=\tan[\kappa \arctan(x_{\mathrm{up}})]$')
+    plt.xlabel(r'$x_{\mathrm{up}}=\Omega_{\mathrm{up}} t_{\mathrm{m}}$')
+    plt.ylabel(r'$\Omega_{\ast} t_{\mathrm{m}}$')
+    plt.title('Long-memory inverse law (high-res edge)')
+    maybe_legend()
+    plt.tight_layout()
+    queue_fig(fig3b, fig_prefix(cfg.outdir, "fig3b_hr.png"))
+    save_csv(
+        fig_prefix(cfg.outdir, "fig3b_hr.csv"),
+        ['t_m_s', 'x_up=Omega_up*t_m', 'Omega_star*t_m', 'g_inf'],
+        [tmL_list, x_up_list, prod_list, g_inf]
+    )
+
 if __name__ == "__main__":
     cfg = TheoryConfig()
     run_nonmarkov_validation(cfg)
@@ -2245,3 +2336,4 @@ if __name__ == "__main__":
     run_paperA_B_extras(cfg)
     validate_paper_claims(cfg)
     flush_all_figs()
+    run_scaling_validation_fast(cfg)
