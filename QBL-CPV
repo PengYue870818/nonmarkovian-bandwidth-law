@@ -95,7 +95,7 @@ def band_C_F(omega, F, omega_min, omega_max):
         return 1.0
     dln = np.log(om[1] / om[0])
     lnspan = log_span(omega_min, omega_max)
-    CF = ((1.0 / (2.0 * np.pi)) * np.sum(F[mask]) * dln) / max(lnspan, 1e-300)
+    CF = ((1.0 / (2.0 * np.pi)) * np.sum((om * F[mask]) * dln)) / max(lnspan, 1e-300)
     return float(CF) if (CF > 0 and np.isfinite(CF)) else 1.0
 
 def get_calibrated_F_for_band(omega, F_raw, omega_min, omega_max):
@@ -105,7 +105,7 @@ def get_calibrated_F_for_band(omega, F_raw, omega_min, omega_max):
     om = omega[mask]
     dln = np.log(om[1] / om[0])
     lnspan = log_span(omega_min, omega_max)
-    C_tilde = ((1.0 / (2.0 * np.pi)) * np.sum(F_raw[mask]) * dln) / max(lnspan, 1e-300)
+    C_tilde = ((1.0 / (2.0 * np.pi)) * np.sum((om * F_raw[mask]) * dln)) / max(lnspan, 1e-300)
     C_tilde = max(float(C_tilde), 1e-300)
     F_eff = F_raw / C_tilde
     return F_eff, C_tilde
@@ -119,8 +119,8 @@ def lever_integral_log(omega, F, S_over_S0, omega_min, omega_max):
         return 0.0
     dln = np.log(om[1] / om[0])
     CF = band_C_F(omega, F, omega_min, omega_max)
-    q = ((F / (2.0 * np.pi)) * (S_over_S0)) / max(CF, 1e-300)
-    lever = float(np.sum(q[mask]) * dln)
+    q = (((omega * F) / (2.0 * np.pi)) * (S_over_S0)) / max(CF, 1e-300)
+    lever = float(np.sum(q[mask] * dln))
     return lever
 
 def dedup_average_by_freq(f, s):
@@ -179,6 +179,17 @@ def band_log_slope(metric_vals, omega_band):
     slope = np.gradient(lny, dln)
     return float(np.max(np.abs(slope)))
 
+def compute_Lq_from_q(omega_band, q_vals):
+    om = np.array(omega_band, dtype=float).ravel()
+    q = np.maximum(np.array(q_vals, dtype=float).ravel(), 1e-300)
+    if om.size < 3 or q.size < 3:
+        return 0.0
+    lnw = np.log(om)
+    lnq = np.log(q)
+    dln = lnw[1] - lnw[0]
+    dlnq = np.gradient(lnq, dln)
+    return float(np.max(np.abs(dlnq)))
+
 def compute_band_metrics_from_arrays(omega, Fg, Sg, Omega_min_used, omega_upper):
     mask = (omega >= Omega_min_used) & (omega <= omega_upper)
     if np.sum(mask) < 3:
@@ -192,16 +203,18 @@ def compute_band_metrics_from_arrays(omega, Fg, Sg, Omega_min_used, omega_upper)
         return None
     i0 = idx0[0]
     S0 = max(Sg[i0], 1e-300)
-    q = ((Fg / (2.0 * np.pi)) * (Sg / S0)) / max(CF, 1e-300)
-    lever = float(np.sum(q[mask]) * dln)
+    q_full = (((omega * Fg) / (2.0 * np.pi)) * (Sg / S0)) / max(CF, 1e-300)
+    q_band = q_full[mask]
+    lever = float(np.sum(q_band * dln))
     alpha = lever / max(Delta, 1e-300)
     S_norm = Sg[mask] / S0
-    F_norm = Fg[mask] / (2.0 * np.pi)
+    F_norm_for_slope = (om * Fg[mask]) / (2.0 * np.pi)
     L_S = band_log_slope(S_norm, om)
-    L_F = band_log_slope(F_norm, om)
+    L_F = band_log_slope(F_norm_for_slope, om)
     LSDelta = L_S * Delta
     LFDelta = L_F * Delta
-    return Delta, lever, alpha, LSDelta, LFDelta, om, q[mask], L_S, L_F
+    L_q = compute_Lq_from_q(om, q_band)
+    return Delta, lever, alpha, LSDelta, LFDelta, om, q_band, L_S, L_F, L_q
 
 def interpolate_loglog(Omega_data, S_data, Omega_grid):
     Svals_clip = np.maximum(S_data, 1e-30)
@@ -312,7 +325,7 @@ def compute_metrics_for_dt_mode(Omega_data, PSD_data, delta_t, kappa, mode='SM',
     met = compute_band_metrics_from_arrays(omega, F_raw, Sg, Omega_min_used, omega_max_op)
     if met is None:
         return None
-    Delta, lever, alpha, LSDelta, LFDelta, om_band, q_band, L_S, L_F = met
+    Delta, lever, alpha, LSDelta, LFDelta, om_band, q_band, L_S, L_F, L_q = met
     gap = inequality_min_gap(omH, Hfrac, omW, Wfrac, trim_frac=0.20)
     theta_m = (tau_est / max(delta_t, 1e-30) if mode == 'SM' else max(delta_t, 1e-30) / tau_est) if (np.isfinite(tau_est) and tau_est > 0) else np.nan
     eps_edge = float(np.log(max(c_kappa_up / max(omega_star, 1e-30), 1.0)))
@@ -326,7 +339,7 @@ def compute_metrics_for_dt_mode(Omega_data, PSD_data, delta_t, kappa, mode='SM',
     norm_err_duhamel, T_time = duhamel_time_kernel_norm_err_equiv(Delta, J_total)
     CF = band_C_F(omega, F_raw, Omega_min_used, omega_max_op)
     S0_norm = max(Sg[0], 1e-300)
-    q_band_full = ((F_raw / (2.0 * np.pi)) * (Sg / S0_norm)) / max(CF, 1e-300)
+    q_band_full = (((omega * F_raw) / (2.0 * np.pi)) * (Sg / S0_norm)) / max(CF, 1e-300)
     mask_band = (omega >= Omega_min_used) & (omega <= omega_max_op)
     if np.sum(mask_band) >= 2:
         dln = np.log(omega[1] / omega[0])
@@ -357,6 +370,7 @@ def compute_metrics_for_dt_mode(Omega_data, PSD_data, delta_t, kappa, mode='SM',
         'LFDelta': LFDelta,
         'L_S': L_S,
         'L_F': L_F,
+        'L_q': L_q,
         'tau_est': tau_est,
         'theta_m': theta_m,
         'eps_edge': eps_edge,
@@ -404,20 +418,21 @@ def enforce_msis_on_result(res, mode='SM', eps0=0.10, alpha_tol=0.02, min_delta=
         met = compute_band_metrics_from_arrays(Omega, F_raw, Sg, Omega_min_used, upper)
         if met is None:
             continue
-        Delta, lever, alpha, LSDelta, LFDelta, om_band, q_band, L_S, L_F = met
+        Delta, lever, alpha, LSDelta, LFDelta, om_band, q_band, L_S, L_F, L_q = met
         if not (np.isfinite(Delta) and Delta >= min_delta):
             continue
         cons = LSDelta if mode == 'SM' else LFDelta
         pen = max(0.0, cons - eps0)
-        cand = (max(abs(alpha - 1.0) - alpha_tol, 0.0), pen, -Delta, upper, Delta, lever, alpha, LSDelta, LFDelta, om_band, q_band, L_S, L_F)
+        cand = (max(abs(alpha - 1.0) - alpha_tol, 0.0), pen, -Delta, upper, Delta, lever, alpha, LSDelta, LFDelta, om_band, q_band, L_S, L_F, L_q)
         if (best is None) or (cand < best):
             best = cand
     if best is None:
         res['memory_label'] = memory_label_from_metrics(res.get('LSDelta', np.nan), res.get('LFDelta', np.nan), mode)
         return res
-    _, _, _, upper_sel, Delta, lever, alpha, LSDelta, LFDelta, om_band, q_band, L_S, L_F = best
+    _, _, _, upper_sel, Delta, lever, alpha, LSDelta, LFDelta, om_band, q_band, L_S, L_F, L_q = best
     F_eff, C_tilde = get_calibrated_F_for_band(Omega, F_raw, Omega_min_used, upper_sel)
-    chi_arr = chi_hat_dimless(Omega * res.get('chi_w0', 1.0), mode=res.get('chi_mode', 'flat'), strength=res.get('chi_strength', 0.0), w0=res.get('chi_w0', 1.0))
+    dt_here = res.get('delta_t', 1.0)
+    chi_arr = chi_hat_dimless(Omega * dt_here, mode=res.get('chi_mode', 'flat'), strength=res.get('chi_strength', 0.0), w0=res.get('chi_w0', 1.0))
     J_F, chi_avg, J_total = compute_J_factors(Omega, F_eff, chi_arr, Omega_min_used, upper_sel)
     norm_err_duhamel, T_time = duhamel_time_kernel_norm_err_equiv(Delta, J_total)
     res2 = dict(res)
@@ -431,8 +446,8 @@ def enforce_msis_on_result(res, mode='SM', eps0=0.10, alpha_tol=0.02, min_delta=
     res2['q_vals'] = q_band
     res2['L_S'] = L_S
     res2['L_F'] = L_F
-    cons = LSDelta if mode == 'SM' else LFDelta
-    res2['err_bound'] = 0.5 * max(cons if np.isfinite(cons) else 0.0, 0.0) * (Delta ** 2)
+    res2['L_q'] = L_q
+    res2['err_bound'] = 0.5 * max(L_q, 0.0) * (Delta ** 2)
     res2['memory_label'] = memory_label_from_metrics(LSDelta, LFDelta, mode)
     res2['F_eff'] = F_eff
     res2['C_tilde'] = C_tilde
@@ -521,7 +536,7 @@ def per_platform_outputs(tag, res, outdir, mode_suffix):
     omega_star = res['omega_star']; c_kappa_up = res['c_kappa_up']; omega_max_op = res['omega_max_op']; edge_active = res.get('edge_active', '')
     Delta = res['Delta']; lever = res['lever']; alpha = res['alpha']; gap = res['gap']
     LSDelta = res.get('LSDelta', np.nan); LFDelta = res.get('LFDelta', np.nan)
-    L_S = res.get('L_S', np.nan); L_F = res.get('L_F', np.nan)
+    L_S = res.get('L_S', np.nan); L_F = res.get('L_F', np.nan); L_q = res.get('L_q', np.nan)
     tau_est = res.get('tau_est', np.nan); theta_m = res.get('theta_m', np.nan); eps_edge = res.get('eps_edge', np.nan)
     S_source = res.get('S_source', 'measured'); c_in_used = res.get('c_in_used', np.inf)
     chi_mode = res.get('chi_mode', 'flat'); chi_strength = res.get('chi_strength', 0.0); chi_w0 = res.get('chi_w0', np.nan)
@@ -560,8 +575,8 @@ def per_platform_outputs(tag, res, outdir, mode_suffix):
              ['Omega', 'H_over_Hup', 'Wplus_over_WplusUp', 'kappa', 'omega_star', 'c_kappa_up', 'omega_op_max', 'Omega_min', 'Omega_up', 'inequality_gap', 'mode', 'S_source', 'edge_active'],
              [omH, Hfrac, np.interp(omH, omW, Wfrac), 0.8, omega_star, c_kappa_up, omega_max_op, Omega_min_used, Omega_up_used, gap, mode_suffix, S_source, edge_active])
     save_csv(os.path.join(outdir, f"{tag}_window_spectrum_{mode_suffix}.csv"),
-             ['Omega', 'F_raw_over_2pi', 'F_eff_over_2pi', 'S_over_S0', 'Omega_min', 'Omega_up', 'Omega_op_max', 'c_in', 'edge_active', 'C_tilde', 'Delta', 'lever', 'alpha', 'LSDelta', 'LFDelta', 'L_S', 'L_F', 'tau_est', 'theta_m', 'eps_edge', 'W_t_NM', 'E_le_norm', 'E_e_norm', 'J_F', 'chi_avg', 'J_total', 'chi_mode', 'chi_strength', 'chi_w0', 'duhamel_norm_err', 'duhamel_T_time', 'mode', 'S_source'],
-             [omega, F_raw / (2.0 * np.pi), F_eff / (2.0 * np.pi), Sg / S0, Omega_min_used, Omega_up_used, omega_max_op, c_in_used, edge_active, C_tilde, Delta, lever, alpha, LSDelta, LFDelta, L_S, L_F, tau_est, theta_m, eps_edge, W_t_NM, E_le_norm, E_e_norm, J_F, chi_avg, J_total, chi_mode, chi_strength, chi_w0, duhamel_err, duhamel_T_time, mode_suffix, S_source])
+             ['Omega', 'F_raw_over_2pi', 'F_eff_over_2pi', 'S_over_S0', 'Omega_min', 'Omega_up', 'Omega_op_max', 'c_in', 'edge_active', 'C_tilde', 'Delta', 'lever', 'alpha', 'LSDelta', 'LFDelta', 'L_S', 'L_F', 'L_q', 'tau_est', 'theta_m', 'eps_edge', 'W_t_NM', 'E_le_norm', 'E_e_norm', 'J_F', 'chi_avg', 'J_total', 'chi_mode', 'chi_strength', 'chi_w0', 'duhamel_norm_err', 'duhamel_T_time', 'mode', 'S_source'],
+             [omega, F_raw / (2.0 * np.pi), F_eff / (2.0 * np.pi), Sg / S0, Omega_min_used, Omega_up_used, omega_max_op, c_in_used, edge_active, C_tilde, Delta, lever, alpha, LSDelta, LFDelta, L_S, L_F, L_q, tau_est, theta_m, eps_edge, W_t_NM, E_le_norm, E_e_norm, J_F, chi_avg, J_total, chi_mode, chi_strength, chi_w0, duhamel_err, duhamel_T_time, mode_suffix, S_source])
     fig2 = plt.figure(figsize=(6.0, 4.0))
     if (q_omega is not None) and (q_vals is not None):
         plt.semilogx(q_omega, q_vals, '-', lw=2.0, color='#4C78A8')
@@ -571,11 +586,11 @@ def per_platform_outputs(tag, res, outdir, mode_suffix):
     fig2.savefig(os.path.join(outdir, f"{tag}_q_flatness_{mode_suffix}.png"), dpi=220, bbox_inches='tight')
     plt.close(fig2)
     save_csv(os.path.join(outdir, f"{tag}_q_flatness_{mode_suffix}.csv"),
-             ['Omega', 'q', 'Omega_min', 'Omega_op_max', 'Delta', 'lever', 'alpha', 'LSDelta', 'LFDelta', 'L_S', 'L_F', 'tau_est', 'theta_m', 'eps_edge', 'W_t_NM', 'E_le_norm', 'E_e_norm', 'J_F', 'chi_avg', 'J_total', 'chi_mode', 'chi_strength', 'chi_w0', 'duhamel_norm_err', 'duhamel_T_time', 'mode', 'S_source'],
-             [q_omega if q_omega is not None else [], q_vals if q_vals is not None else [], Omega_min_used, omega_max_op, Delta, lever, alpha, LSDelta, LFDelta, L_S, L_F, tau_est, theta_m, eps_edge, W_t_NM, E_le_norm, E_e_norm, J_F, chi_avg, J_total, chi_mode, chi_strength, chi_w0, duhamel_err, duhamel_T_time, mode_suffix, S_source])
+             ['Omega', 'q', 'Omega_min', 'Omega_op_max', 'Delta', 'lever', 'alpha', 'LSDelta', 'LFDelta', 'L_S', 'L_F', 'L_q', 'tau_est', 'theta_m', 'eps_edge', 'W_t_NM', 'E_le_norm', 'E_e_norm', 'J_F', 'chi_avg', 'J_total', 'chi_mode', 'chi_strength', 'chi_w0', 'duhamel_norm_err', 'duhamel_T_time', 'mode', 'S_source'],
+             [q_omega if q_omega is not None else [], q_vals if q_vals is not None else [], Omega_min_used, omega_max_op, Delta, lever, alpha, LSDelta, LFDelta, L_S, L_F, L_q, tau_est, theta_m, eps_edge, W_t_NM, E_le_norm, E_e_norm, J_F, chi_avg, J_total, chi_mode, chi_strength, chi_w0, duhamel_err, duhamel_T_time, mode_suffix, S_source])
     save_csv(os.path.join(outdir, f"{tag}_band_summary_{mode_suffix}.csv"),
-             ['Omega_min', 'Omega_up', 'omega_star', 'c_kappa_up', 'omega_op_max', 'c_in', 'edge_active', 'Delta', 'lever', 'alpha', 'LSDelta', 'LFDelta', 'L_S', 'L_F', 'tau_est', 'theta_m', 'eps_edge', 'W_t_NM', 'E_le_norm', 'E_e_norm', 'J_F', 'chi_avg', 'J_total', 'chi_mode', 'chi_strength', 'chi_w0', 'duhamel_norm_err', 'duhamel_T_time', 'gap', 'mode', 'S_source'],
-             [Omega_min_used, Omega_up_used, omega_star, c_kappa_up, omega_max_op, c_in_used, edge_active, Delta, lever, alpha, LSDelta, LFDelta, L_S, L_F, tau_est, theta_m, eps_edge, W_t_NM, E_le_norm, E_e_norm, J_F, chi_avg, J_total, chi_mode, chi_strength, chi_w0, duhamel_err, duhamel_T_time, gap, mode_suffix, S_source])
+             ['Omega_min', 'Omega_up', 'omega_star', 'c_kappa_up', 'omega_op_max', 'c_in', 'edge_active', 'Delta', 'lever', 'alpha', 'LSDelta', 'LFDelta', 'L_S', 'L_F', 'L_q', 'tau_est', 'theta_m', 'eps_edge', 'W_t_NM', 'E_le_norm', 'E_e_norm', 'J_F', 'chi_avg', 'J_total', 'chi_mode', 'chi_strength', 'chi_w0', 'duhamel_norm_err', 'duhamel_T_time', 'gap', 'mode', 'S_source'],
+             [Omega_min_used, Omega_up_used, omega_star, c_kappa_up, omega_max_op, c_in_used, edge_active, Delta, lever, alpha, LSDelta, LFDelta, L_S, L_F, L_q, tau_est, theta_m, eps_edge, W_t_NM, E_le_norm, E_e_norm, J_F, chi_avg, J_total, chi_mode, chi_strength, chi_w0, duhamel_err, duhamel_T_time, gap, mode_suffix, S_source])
     return {
         'tag': tag,
         'delta_t': res.get('delta_t', np.nan),
@@ -592,6 +607,7 @@ def per_platform_outputs(tag, res, outdir, mode_suffix):
         'LFDelta': LFDelta,
         'L_S': L_S,
         'L_F': L_F,
+        'L_q': L_q,
         'tau_est': tau_est,
         'theta_m': theta_m,
         'eps_edge': eps_edge,
@@ -664,10 +680,9 @@ def cross_platform_collapse(results, outdir, mode_suffix):
         if (r is None) or (not np.isfinite(r.get('Delta', np.nan))) or (r['Delta'] <= 0):
             continue
         xs.append(r['Delta']); ys.append(r['lever']); labs.append(r['tag'])
-        L_S = r.get('L_S', np.nan); L_F = r.get('L_F', np.nan)
-        LqDelta = (L_S + L_F) * r['Delta'] if np.isfinite(L_S) and np.isfinite(L_F) else np.nan
-        lq_vals.append(LqDelta)
-        err_like = 0.5 * max(LqDelta if np.isfinite(LqDelta) else 0.0, 0.0) * (r['Delta'] ** 2)
+        L_q = r.get('L_q', np.nan)
+        lq_vals.append(L_q)
+        err_like = 0.5 * max(L_q if np.isfinite(L_q) else 0.0, 0.0) * (r['Delta'] ** 2)
         errs.append(err_like)
         a = r.get('alpha', np.nan); alphas.append(a)
         alpha_errs.append((err_like / max(r['Delta'], 1e-30)) if (np.isfinite(err_like) and r['Delta'] > 0) else np.nan)
@@ -703,10 +718,12 @@ def cross_platform_collapse(results, outdir, mode_suffix):
         Sxy = float(np.sum(xs_arr[mask] * ys_arr[mask]))
         slope = Sxy / max(Sxx, 1e-30)
         yhat = slope * xs_arr[mask]
-        RSS = float(np.sum((ys_arr[mask] - yhat) ** 2))
-        n = int(np.sum(mask))
-        dof = max(n - 1, 1)
-        se_slope = float(np.sqrt(RSS / max(dof, 1)) / max(np.sqrt(Sxx), 1e-30))
+        SSE = float(np.sum((ys_arr[mask] - yhat) ** 2))
+        SST0 = float(np.sum((ys_arr[mask]) ** 2))
+        R2 = 1.0 - SSE / max(SST0, 1e-30)
+        dof = max(int(np.sum(mask)) - 1, 1)
+        sigma2 = SSE / max(dof, 1)
+        se_slope = float(np.sqrt(sigma2 / max(Sxx, 1e-30)))
         tval = float(t.ppf(0.975, dof))
         band_up = (slope + tval * se_slope) * xline
         band_lo = (slope - tval * se_slope) * xline
@@ -714,8 +731,6 @@ def cross_platform_collapse(results, outdir, mode_suffix):
         plt.fill_between(xline, band_lo, band_up, color='r', alpha=0.28, label='95% CI (global fit)', zorder=1)
         plt.plot(xline, band_lo, color='r', lw=1.2, alpha=0.9, zorder=2)
         plt.plot(xline, band_up, color='r', lw=1.2, alpha=0.9, zorder=2)
-        TSS = float(np.sum((ys_arr[mask] - np.mean(ys_arr[mask])) ** 2))
-        R2 = 1.0 - RSS / max(TSS, 1e-300)
     else:
         slope = np.nan; R2 = np.nan; se_slope = np.nan
     for lab, c, a, ae in zip(labs, cols, alphas, alpha_errs):
@@ -743,7 +758,7 @@ def cross_platform_collapse(results, outdir, mode_suffix):
     plt.savefig(fig_path, dpi=220, bbox_inches='tight')
     plt.close()
     save_csv(os.path.join(outdir, f"cross_platform_collapse_{mode_suffix}.csv"),
-             ['platform', 'Delta', 'lever', 'alpha', 'alpha_err', 'LqDelta', 'err_bound_like', 'diff(lever-Delta)', 'slope_fit', 'slope_se', 'R2', 'figure'],
+             ['platform', 'Delta', 'lever', 'alpha', 'alpha_err', 'Lq', 'err_bar', 'diff(lever-Delta)', 'slope_fit', 'slope_se', 'R2', 'figure'],
              [labs, xs_arr, ys_arr, alphas, alpha_errs, lq_vals,
               [0.5 * max((lq_vals[i] if i < len(lq_vals) and np.isfinite(lq_vals[i]) else 0.0), 0.0) * (xs_arr[i] ** 2) if np.isfinite(xs_arr[i]) else np.nan for i in range(len(xs_arr))],
               (ys_arr - xs_arr) if np.all(np.isfinite(xs_arr)) else [], slope, se_slope, R2, fig_path])
@@ -784,7 +799,7 @@ def plot_radiation_ranges(results, outdir, mode_suffix):
     plt.savefig(fig_path, dpi=220, bbox_inches='tight')
     plt.close()
     save_csv(os.path.join(outdir, f"radiation_range_{mode_suffix}.csv"),
-             ['platform', 'Omega_min', 'Omega_up', 'omega_star', 'c_kappa_up', 'omega_op_max', 'c_in', 'edge_active', 'Delta', 'lever', 'alpha', 'L_S', 'L_F', 'tau_est', 'theta_m', 'eps_edge', 'W_t_NM', 'E_le_norm', 'E_e_norm', 'J_F', 'chi_avg', 'J_total', 'chi_mode', 'chi_strength', 'chi_w0', 'duhamel_norm_err', 'duhamel_T_time', 'gap', 'mode', 'S_source', 'figure'],
+             ['platform', 'Omega_min', 'Omega_up', 'omega_star', 'c_kappa_up', 'omega_op_max', 'c_in', 'edge_active', 'Delta', 'lever', 'alpha', 'L_S', 'L_F', 'L_q', 'tau_est', 'theta_m', 'eps_edge', 'W_t_NM', 'E_le_norm', 'E_e_norm', 'J_F', 'chi_avg', 'J_total', 'chi_mode', 'chi_strength', 'chi_w0', 'duhamel_norm_err', 'duhamel_T_time', 'gap', 'mode', 'S_source', 'figure'],
              [[r['tag'] for r in results],
               [r['Omega_min'] for r in results],
               [r['Omega_up'] for r in results],
@@ -798,6 +813,7 @@ def plot_radiation_ranges(results, outdir, mode_suffix):
               [r['alpha'] for r in results],
               [r.get('L_S', np.nan) for r in results],
               [r.get('L_F', np.nan) for r in results],
+              [r.get('L_q', np.nan) for r in results],
               [r.get('tau_est', np.nan) for r in results],
               [r.get('theta_m', np.nan) for r in results],
               [r.get('eps_edge', np.nan) for r in results],
